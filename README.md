@@ -5,7 +5,7 @@ first principles. The point of the project is the **reliability machinery** —
 atomic job claim, crash recovery, retries with backoff, and a dead-letter
 queue — written by hand rather than delegated to an existing job-queue library.
 
-> Status: Stage 0 of 6 complete — foundation. See [Roadmap](#roadmap).
+> Status: Stage 1 of 6 complete — jobs now run end-to-end. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -37,13 +37,23 @@ pip install -r requirements.txt
 python -m taskq.smoke
 ```
 
-Expected output:
+### Running jobs (Stage 1)
 
+Two terminals — one worker, one producer:
+
+```bash
+# terminal 1: start a worker that waits for jobs
+python -m taskq.worker
+
+# terminal 2: enqueue a few demo jobs
+python -m taskq.enqueue_demo
 ```
-[ok] connected to Redis at localhost:6379
-[ok] round-tripped job <id> (send_email) through Redis
 
-Stage 0 smoke test passed.
+Or drain the queue once and exit (handy for a quick check):
+
+```bash
+python -m taskq.enqueue_demo
+python -m taskq.worker --burst
 ```
 
 ## Project layout
@@ -57,13 +67,18 @@ reliable-task-queue/
     ├── config.py           # environment-driven config
     ├── job.py              # the Job model + JSON serialization
     ├── redis_client.py     # Redis connection factory
+    ├── registry.py         # @task decorator + name -> handler lookup
+    ├── queue.py            # Redis-list-backed FIFO queue (enqueue/dequeue)
+    ├── worker.py           # the worker loop that runs jobs
+    ├── example_tasks.py    # demo tasks
+    ├── enqueue_demo.py     # demo producer
     └── smoke.py            # Stage 0 verification
 ```
 
 ## Roadmap
 
 - [x] **Stage 0 — Foundation:** project scaffolding, Redis via Docker, Job model, smoke test.
-- [ ] **Stage 1 — MVP happy path:** enqueue → single worker → run.
+- [x] **Stage 1 — MVP happy path:** `@task` registry, `enqueue()` onto a Redis list, single worker that runs jobs.
 - [ ] **Stage 2 — Reliability core:** atomic claim, visibility timeout, retries + backoff, dead-letter.
 - [ ] **Stage 3 — Scale & scheduling:** concurrent workers, priorities, delayed jobs, idempotency.
 - [ ] **Stage 4 — Observability:** metrics + web dashboard.
