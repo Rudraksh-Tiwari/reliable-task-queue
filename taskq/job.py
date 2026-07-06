@@ -34,7 +34,8 @@ class Job:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: str = JobStatus.QUEUED.value
     attempts: int = 0  # how many times execution has been attempted
-    max_retries: int = 3  # attempts allowed before the job is declared dead
+    max_retries: int = 3  # retries allowed after the first attempt fails
+    error: str | None = None  # last failure, e.g. "RuntimeError: boom"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 
@@ -51,6 +52,26 @@ class Job:
     @classmethod
     def from_json(cls, raw: str) -> "Job":
         return cls(**json.loads(raw))
+
+    @classmethod
+    def from_hash(cls, data: str, attempts: int | str = 0,
+                  status: str | None = None, error: str | None = None) -> "Job":
+        """Rebuild a Job from its Redis hash fields.
+
+        The JSON 'data' blob is the immutable job description written once
+        at enqueue time. Mutable execution state (attempts/status/error)
+        lives in separate hash fields so Redis can update it atomically
+        (HINCRBY) without parsing or rewriting JSON. The fields are the
+        authoritative values, so they override whatever stale copies the
+        blob still carries.
+        """
+        job = cls.from_json(data)
+        job.attempts = int(attempts)
+        if status:
+            job.status = status
+        if error:
+            job.error = error
+        return job
 
     def touch(self) -> None:
         """Refresh the modified timestamp whenever the job's state changes."""
