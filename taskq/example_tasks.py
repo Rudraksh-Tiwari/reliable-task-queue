@@ -47,3 +47,19 @@ def slow_marker(seconds: float, key: str) -> str:
     r = make_redis(load_config())
     r.set(key, "1")
     return f"marker {key} set"
+
+
+@task
+def incr(key: str) -> int:
+    # Increments a counter. The Stage 3 contention test enqueues one of
+    # these per unique key across several competing workers: every counter
+    # ending at exactly 1 proves no job was double-claimed OR lost.
+    # (A fresh connection per call is fine at demo scale.)
+    return make_redis(load_config()).incr(key)
+
+
+@task
+def record(label: str, list_key: str) -> int:
+    # Appends a label to a results list - execution order made observable.
+    # The priority test asserts all "high" labels precede all "normal", etc.
+    return make_redis(load_config()).rpush(list_key, label)

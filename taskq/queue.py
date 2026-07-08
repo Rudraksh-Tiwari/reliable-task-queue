@@ -22,8 +22,16 @@ class Queue:
         self.name = name
         self._broker = Broker(redis_conn, config, queue_name=name)
 
-    def enqueue(self, job: Job) -> None:
-        self._broker.enqueue(job)
+    def enqueue(self, job: Job, *, delay_seconds: float | None = None,
+                run_at: float | None = None) -> str:
+        """Enqueue now, or later via delay_seconds / run_at (unix time).
+
+        Priority and idempotency travel ON the job (job.priority,
+        job.idempotency_key). Returns the live job id - if an idempotency
+        key suppressed this enqueue, that's the EXISTING job's id.
+        """
+        return self._broker.enqueue(job, delay_seconds=delay_seconds,
+                                    run_at=run_at)
 
     def size(self) -> int:
         return self._broker.queue_depth()

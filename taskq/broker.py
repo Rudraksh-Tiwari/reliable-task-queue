@@ -3,17 +3,18 @@
 This is the reliability core of the project. A job is always in exactly one
 of these Redis structures, and only broker operations move it between them:
 
-    ready queue (list) --claim--> in-flight (zset, scored by lease deadline)
+    ready lanes (3 lists) --claim--> in-flight (zset, scored by lease deadline)
     in-flight --ack--> gone (success; payload deleted)
     in-flight --fail--> scheduled (zset, scored by retry time)  [retries left]
     in-flight --fail/bury--> dead-letter (list)                 [budget spent]
-    scheduled --promote--> ready queue        (backoff elapsed)
-    in-flight --promote--> ready queue        (lease expired = worker died)
+    scheduled --promote--> ready lanes   (backoff elapsed / delay arrived)
+    in-flight --promote--> ready lanes   (lease expired = worker died)
 
 The claim and promote transitions are Lua scripts because they MUST be
 atomic (see the .lua files for the full reasoning). The rest are MULTI/EXEC
 pipelines: atomic enough, and easier to read in Python.
 """
+import json
 import logging
 from pathlib import Path
 
@@ -27,6 +28,10 @@ log = logging.getLogger("taskq.broker")
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
 
+#: Lanes in strict dequeue order. Workers fully drain "high" before touching
+#: "normal", and "normal" before "low" (starvation tradeoff: see claim.lua).
+PRIORITIES = ("high", "normal", "low")
+
 
 class Broker:
     def __init__(self, redis_conn: redis.Redis, config: Config,
@@ -36,11 +41,14 @@ class Broker:
         self.queue_name = queue_name
 
         ns = config.namespace
-        self.key_queue = f"{ns}:queue:{queue_name}"        # list of ready job ids
-        self.key_inflight = f"{ns}:inflight:{queue_name}"  # zset id -> lease deadline
-        self.key_scheduled = f"{ns}:scheduled:{queue_name}"  # zset id -> retry-at time
-        self.key_dead = f"{ns}:dead:{queue_name}"          # list of dead job ids
-        self.job_prefix = f"{ns}:job:"                     # hash per job: data/attempts/status/error
+        self.lane_prefix = f"{ns}:queue:{queue_name}:"
+        self.lane_keys = {p: f"{self.lane_prefix}{p}" for p in PRIORITIES}
+        self.key_inflight = f"{ns}:inflight:{queue_name}"   # zset id -> lease deadline
+        self.key_scheduled = f"{ns}:scheduled:{queue_name}"  # zset id -> run-at time
+        self.key_dead = f"{ns}:dead:{queue_name}"            # list of dead job ids
+        self.job_prefix = f"{ns}:job:"     # hash per job: data/attempts/status/error/priority
+        self.idem_prefix = f"{ns}:idem:"   # idempotency slots: user key -> job id
+        self.worker_prefix = f"{ns}:worker:"  # heartbeat keys, TTL'd
 
         # register_script is transport, not logic: it uploads the script once
         # and afterwards invokes it by SHA (EVALSHA), transparently
@@ -50,39 +58,84 @@ class Broker:
             (_SCRIPTS_DIR / "claim.lua").read_text())
         self._promote_script = redis_conn.register_script(
             (_SCRIPTS_DIR / "promote.lua").read_text())
+        self._release_script = redis_conn.register_script(
+            (_SCRIPTS_DIR / "release.lua").read_text())
 
     def job_key(self, job_id: str) -> str:
         return f"{self.job_prefix}{job_id}"
 
     def _server_now(self) -> float:
-        # Schedule retries against REDIS's clock, the same clock the Lua
-        # scripts use. Mixing worker-machine clocks with the server clock
-        # would make lease/retry timing drift with clock skew.
+        # Schedule against REDIS's clock, the same clock the Lua scripts
+        # use. Mixing worker-machine clocks with the server clock would
+        # make lease/retry timing drift with clock skew.
         secs, micros = self.r.time()
         return secs + micros / 1_000_000
 
     # ---- producer side ----------------------------------------------------
 
-    def enqueue(self, job: Job) -> None:
-        # Payload hash and queue entry are written in one MULTI so no
-        # observer (including the claim script) can ever see an id whose
-        # payload doesn't exist yet, or a payload that never got queued.
+    def enqueue(self, job: Job, *, delay_seconds: float | None = None,
+                run_at: float | None = None) -> str:
+        """Add a job. Returns the id that is actually live for this work.
+
+        - Immediate (default): the job enters its priority lane now.
+        - Delayed: with delay_seconds/run_at it parks in the scheduled zset
+          and the reaper promotes it when due (same path retries use).
+        - Idempotent: if job.idempotency_key is set and another job with the
+          same key is still active, nothing is enqueued and the EXISTING
+          job's id is returned (compare it to job.id to detect suppression).
+        """
+        if delay_seconds is not None and run_at is not None:
+            raise ValueError("pass delay_seconds or run_at, not both")
+        if job.priority not in PRIORITIES:
+            raise ValueError(f"unknown priority {job.priority!r}; "
+                             f"expected one of {PRIORITIES}")
+
+        if job.idempotency_key:
+            idem_key = f"{self.idem_prefix}{job.idempotency_key}"
+            # SET NX = "reserve this key only if free" in one atomic step.
+            # The TTL bounds the dedup window even if this producer crashes
+            # one line below (before writing the job): a reservation that
+            # never became a job must not suppress real work forever.
+            reserved = self.r.set(idem_key, job.id, nx=True,
+                                  ex=self.cfg.idem_ttl_seconds)
+            if not reserved:
+                existing = self.r.get(idem_key)
+                log.info("enqueue: duplicate suppressed by idempotency key "
+                         "%r (active job %s)", job.idempotency_key, existing)
+                # The reservation may expire between our failed SET and this
+                # GET; treat that vanishing race as "slot free" and proceed.
+                if existing is not None:
+                    return existing
+
+        if delay_seconds is not None:
+            run_at = self._server_now() + delay_seconds
+
         pipe = self.r.pipeline(transaction=True)
+        # Payload hash and queue entry land in one MULTI so no observer
+        # (including the claim script) can ever see an id whose payload
+        # doesn't exist yet, or a payload that never got queued.
         pipe.hset(self.job_key(job.id), mapping={
             "data": job.to_json(),   # immutable description, written once
             "attempts": 0,            # mutable counter, HINCRBY'd by claim.lua
-            "status": JobStatus.QUEUED.value,
+            "status": (JobStatus.QUEUED.value if run_at is None
+                       else "scheduled"),
             "error": "",
+            "priority": job.priority,  # promote.lua routes recoveries by this
         })
-        pipe.lpush(self.key_queue, job.id)
+        if run_at is None:
+            pipe.lpush(self.lane_keys[job.priority], job.id)
+        else:
+            pipe.zadd(self.key_scheduled, {job.id: run_at})
         pipe.execute()
+        return job.id
 
     # ---- worker side ------------------------------------------------------
 
     def claim(self) -> Job | None:
-        """Atomically pop the next job and lease it to this worker."""
+        """Atomically pop the next job (high lane first) and lease it."""
         res = self._claim_script(
-            keys=[self.key_queue, self.key_inflight],
+            keys=[self.lane_keys["high"], self.lane_keys["normal"],
+                  self.lane_keys["low"], self.key_inflight],
             args=[self.cfg.lease_seconds, self.job_prefix],
         )
         if res is None:
@@ -106,10 +159,10 @@ class Broker:
             # Our lease had already expired and the reaper requeued the job:
             # someone else may run it again. This is the honest cost of
             # at-least-once delivery (the alternative - at-most-once - loses
-            # jobs instead of duplicating them). Idempotency keys (Stage 3)
-            # exist to blunt exactly this.
+            # jobs instead of duplicating them).
             log.warning("ack: lease for %s had already expired; a duplicate "
                         "execution is possible", job.id)
+        self._release_idem(job)
 
     def fail(self, job: Job, exc: BaseException) -> str:
         """Failure: schedule a retry, or bury the job if its budget is spent.
@@ -155,25 +208,61 @@ class Broker:
         })
         pipe.lpush(self.key_dead, job.id)
         pipe.execute()
+        # Dead is a terminal state: free the idempotency slot so the caller
+        # can deliberately enqueue a fresh instance (e.g. after a fix).
+        self._release_idem(job)
         log.error("job %s moved to dead-letter after %d attempt(s): %s",
                   job.id, job.attempts, reason)
+
+    def _release_idem(self, job: Job) -> None:
+        if job.idempotency_key:
+            self._release_script(
+                keys=[f"{self.idem_prefix}{job.idempotency_key}"],
+                args=[job.id])
 
     # ---- recovery (called by the reaper) -----------------------------------
 
     def requeue_expired(self, batch: int = 100) -> int:
-        """Move jobs whose lease deadline passed back to the ready queue."""
+        """Move jobs whose lease deadline passed back to their lanes."""
         return int(self._promote_script(
-            keys=[self.key_inflight, self.key_queue], args=[batch]))
+            keys=[self.key_inflight],
+            args=[batch, self.job_prefix, self.lane_prefix]))
 
     def promote_scheduled(self, batch: int = 100) -> int:
-        """Move jobs whose retry backoff elapsed back to the ready queue."""
+        """Move due scheduled jobs (retries + delayed) back to their lanes."""
         return int(self._promote_script(
-            keys=[self.key_scheduled, self.key_queue], args=[batch]))
+            keys=[self.key_scheduled],
+            args=[batch, self.job_prefix, self.lane_prefix]))
+
+    # ---- worker presence (heartbeats) ---------------------------------------
+
+    def heartbeat(self, worker_id: str, info: dict, ttl: int) -> None:
+        # A plain TTL'd key per worker: if the worker stops beating (crash,
+        # network split), its key simply expires. Liveness = key existence;
+        # no cleanup protocol needed for dead workers.
+        self.r.set(f"{self.worker_prefix}{worker_id}", json.dumps(info),
+                   ex=ttl)
+
+    def live_workers(self) -> list[dict]:
+        workers = []
+        for key in self.r.scan_iter(f"{self.worker_prefix}*", count=100):
+            raw = self.r.get(key)
+            if raw:
+                info = json.loads(raw)
+                info["worker_id"] = key[len(self.worker_prefix):]
+                workers.append(info)
+        return sorted(workers, key=lambda w: w["worker_id"])
 
     # ---- inspection ---------------------------------------------------------
 
+    def lane_depths(self) -> dict[str, int]:
+        pipe = self.r.pipeline(transaction=False)
+        for p in PRIORITIES:
+            pipe.llen(self.lane_keys[p])
+        return dict(zip(PRIORITIES, pipe.execute()))
+
     def queue_depth(self) -> int:
-        return self.r.llen(self.key_queue)
+        return sum(self.lane_depths().values())
 
     def inflight_count(self) -> int:
         return self.r.zcard(self.key_inflight)

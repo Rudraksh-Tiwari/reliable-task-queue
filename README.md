@@ -5,7 +5,7 @@ first principles. The point of the project is the **reliability machinery** —
 atomic job claim, crash recovery, retries with backoff, and a dead-letter
 queue — written by hand rather than delegated to an existing job-queue library.
 
-> Status: Stage 2 of 6 complete — jobs now survive worker crashes. See [Roadmap](#roadmap).
+> Status: Stage 3 of 6 complete — concurrent workers, priorities, delayed jobs, idempotency. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -65,11 +65,13 @@ A job id lives in exactly one structure at a time; atomic operations move it:
 
 | Redis key | Type | Holds |
 |---|---|---|
-| `taskq:queue:<name>` | list | ids ready to run (FIFO) |
+| `taskq:queue:<name>:<prio>` | list | ready ids, one FIFO lane per priority (high/normal/low) |
 | `taskq:inflight:<name>` | zset | claimed ids, scored by lease deadline |
-| `taskq:scheduled:<name>` | zset | failed ids, scored by retry-at time |
+| `taskq:scheduled:<name>` | zset | failed + delayed ids, scored by run-at time |
 | `taskq:dead:<name>` | list | ids that exhausted their retry budget |
-| `taskq:job:<id>` | hash | payload (`data`) + mutable `attempts`/`status`/`error` |
+| `taskq:job:<id>` | hash | payload (`data`) + mutable `attempts`/`status`/`error`/`priority` |
+| `taskq:idem:<key>` | string | active job id holding this idempotency slot (TTL'd) |
+| `taskq:worker:<id>` | string | worker heartbeat info; liveness = key exists (TTL'd) |
 
 The mechanisms, each hand-written:
 
@@ -99,6 +101,35 @@ permanently-failing job reaches the DLQ):
 python -m taskq.verify_stage2
 ```
 
+## Scale & scheduling (Stage 3)
+
+- **Concurrent workers** — `--concurrency N` runs N jobs in parallel per
+  worker via a thread pool (I/O-bound jobs release the GIL; CPU-bound work
+  scales with additional worker *processes* instead — both are supported and
+  both are safe, because claims are serialized by Redis itself).
+- **Priority lanes** — each queue is three FIFO lists (`high`/`normal`/`low`);
+  the claim script drains them in strict order, and recovery re-homes a job
+  to *its own* lane (a rescued high-priority job is never demoted).
+- **Delayed jobs** — `enqueue(job, delay_seconds=…)` / `run_at=…` parks the
+  job in the scheduled zset; the reaper's promote pass delivers it when due
+  (the same machinery retries already use).
+- **Idempotency keys** — `Job(idempotency_key=…)`: while a job with that key
+  is active, duplicate enqueues are suppressed and return the existing job's
+  id. The slot is released on terminal states (success/dead) via an atomic
+  compare-and-delete ([release.lua](taskq/scripts/release.lua) — the same
+  pattern as safe distributed-lock release), and TTL-bounded so a crashed
+  producer can't jam the slot forever.
+- **Worker heartbeats** — every worker maintains a TTL'd presence key;
+  liveness is simply "the key exists", so dead workers clean up after
+  themselves by expiring.
+
+Prove it (contention exactly-once, 1-vs-8 throughput, priority ordering,
+delayed delivery, idempotent dedup):
+
+```bash
+python -m taskq.verify_stage3
+```
+
 ## Project layout
 
 ```
@@ -117,12 +148,14 @@ reliable-task-queue/
     │   ├── claim.lua       # atomic pop + lease + attempt-count (the heart)
     │   └── promote.lua     # atomic "move due ids from zset to queue"
     ├── retry.py            # capped exponential backoff + jitter
-    ├── reaper.py           # recovery thread: expired leases + due retries
-    ├── worker.py           # the worker loop that runs jobs
+    ├── reaper.py           # recovery thread: expired leases + due retries/delays
+    ├── heartbeat.py        # worker presence via TTL'd keys
+    ├── worker.py           # the worker loop (thread-pool concurrency)
     ├── example_tasks.py    # demo tasks
     ├── enqueue_demo.py     # demo producer
     ├── smoke.py            # Stage 0 verification
-    └── verify_stage2.py    # Stage 2 proof: crash recovery + DLQ, automated
+    ├── verify_stage2.py    # Stage 2 proof: crash recovery + DLQ, automated
+    └── verify_stage3.py    # Stage 3 proof: contention/throughput/priority/delay/idem
 ```
 
 ## Roadmap
@@ -130,7 +163,7 @@ reliable-task-queue/
 - [x] **Stage 0 — Foundation:** project scaffolding, Redis via Docker, Job model, smoke test.
 - [x] **Stage 1 — MVP happy path:** `@task` registry, `enqueue()` onto a Redis list, single worker that runs jobs.
 - [x] **Stage 2 — Reliability core:** atomic claim (Lua), lease + reaper crash recovery, retries with backoff + jitter, dead-letter queue, automated chaos verification.
-- [ ] **Stage 3 — Scale & scheduling:** concurrent workers, priorities, delayed jobs, idempotency.
+- [x] **Stage 3 — Scale & scheduling:** thread-pool concurrency, strict priority lanes, delayed jobs, idempotency keys, worker heartbeats.
 - [ ] **Stage 4 — Observability:** metrics + web dashboard.
 - [ ] **Stage 5 — Proof & polish:** load test, chaos test, docs, benchmarks.
 - [ ] **Stage 6 — Distributed (stretch):** multi-node workers.

@@ -31,6 +31,13 @@ class Job:
     args: list = field(default_factory=list)
     kwargs: dict = field(default_factory=dict)
 
+    # Which lane this job waits in: "high", "normal", or "low". Strict
+    # priority: a worker always drains high before touching normal.
+    priority: str = "normal"
+    # Optional dedup handle. While a job with this key is active (queued /
+    # running / awaiting retry), enqueues with the same key are suppressed.
+    idempotency_key: str | None = None
+
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     status: str = JobStatus.QUEUED.value
     attempts: int = 0  # how many times execution has been attempted

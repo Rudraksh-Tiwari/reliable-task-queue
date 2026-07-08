@@ -40,6 +40,15 @@ class Config:
     retry_cap: float
     retry_jitter: float
 
+    # -- scale & scheduling knobs (Stage 3) --
+    # How long an idempotency key suppresses duplicates, even if the job
+    # somehow never reaches a terminal state (crash between reserving the
+    # key and writing the job). A TTL'd dedup WINDOW is the honest promise
+    # real systems make (e.g. Stripe: 24h) - not dedup-forever.
+    idem_ttl_seconds: int
+    # How often a worker refreshes its presence key (dashboards use this).
+    heartbeat_interval: float
+
 
 def load_config() -> Config:
     return Config(
@@ -53,4 +62,6 @@ def load_config() -> Config:
         retry_base=float(os.getenv("TQ_RETRY_BASE", "2")),
         retry_cap=float(os.getenv("TQ_RETRY_CAP", "120")),
         retry_jitter=float(os.getenv("TQ_RETRY_JITTER", "0.25")),
+        idem_ttl_seconds=int(os.getenv("TQ_IDEM_TTL", "86400")),
+        heartbeat_interval=float(os.getenv("TQ_HEARTBEAT_INTERVAL", "5")),
     )

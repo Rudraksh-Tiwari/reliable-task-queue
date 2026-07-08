@@ -1,4 +1,4 @@
--- claim.lua - atomically claim the next job from a queue.
+-- claim.lua - atomically claim the next job across the priority lanes.
 --
 -- WHY THIS IS A SCRIPT (the core interview answer):
 -- A naive worker runs two commands: RPOP (take the job) and then ZADD
@@ -12,12 +12,16 @@
 -- any client interleaves with it. So "pop + record lease + count the
 -- attempt" become a single indivisible CLAIM. Either the job stays
 -- queued, or it is in-flight with a lease - there is no in-between
--- state, no matter when the worker dies.
+-- state, no matter when the worker dies. This also makes MANY workers
+-- safe: two workers can never claim the same job, because their claims
+-- are serialized by Redis itself.
 --
--- KEYS[1] = ready queue list      (e.g. "taskq:queue:default")
--- KEYS[2] = in-flight zset        (e.g. "taskq:inflight:default")
+-- KEYS[1] = high-priority lane     (list, e.g. "taskq:queue:default:high")
+-- KEYS[2] = normal-priority lane   (list, e.g. "taskq:queue:default:normal")
+-- KEYS[3] = low-priority lane      (list, e.g. "taskq:queue:default:low")
+-- KEYS[4] = in-flight zset         (e.g. "taskq:inflight:default")
 -- ARGV[1] = lease duration in seconds
--- ARGV[2] = job-hash key prefix   (e.g. "taskq:job:")
+-- ARGV[2] = job-hash key prefix    (e.g. "taskq:job:")
 --
 -- Note on ARGV[2]: the job's hash key is built inside the script because
 -- we cannot know the job id until after RPOP. Building key names in Lua
@@ -25,12 +29,23 @@
 -- cluster router must know all keys up front). Deliberate tradeoff,
 -- documented here and in the README.
 
--- Pop the id of the oldest waiting job. Producers LPUSH onto the left
--- end, so the right end is the front of the FIFO line. In Lua, RPOP
--- returns boolean false (not nil) when the list is empty.
-local id = redis.call('RPOP', KEYS[1])
+-- Try the lanes strictly in priority order: high, then normal, then low.
+-- STRICT priority is a deliberate tradeoff: it is simple and predictable,
+-- but a constant flood of high-priority work can starve the low lane.
+-- Real systems that need fairness use weighted dequeue (e.g. pick high
+-- with probability 0.7); strict is the right default for a queue where
+-- "high" means "genuinely urgent and rare".
+local id
+for i = 1, 3 do
+  -- Producers LPUSH onto the left end, so the right end is the front of
+  -- each FIFO lane. In Lua, RPOP returns boolean false when empty.
+  id = redis.call('RPOP', KEYS[i])
+  if id then
+    break
+  end
+end
 
--- Empty queue: return nil so the worker knows there is nothing to do.
+-- All three lanes empty: return nil so the worker knows to idle.
 if not id then
   return nil
 end
@@ -39,7 +54,7 @@ end
 local job_key = ARGV[2] .. id
 
 -- Fetch the immutable job description (the JSON blob written at enqueue
--- time: task name, args, kwargs, max_retries, ...).
+-- time: task name, args, kwargs, max_retries, priority, ...).
 local data = redis.call('HGET', job_key, 'data')
 
 -- Defensive check: an id whose payload hash is missing. Our enqueue
@@ -68,17 +83,17 @@ local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local attempts = redis.call('HINCRBY', job_key, 'attempts', 1)
 
 -- Advisory label for humans and dashboards. The AUTHORITATIVE state is
--- which structure the id currently lives in (queue / in-flight /
+-- which structure the id currently lives in (lane / in-flight /
 -- scheduled / dead): a label can go stale, set membership cannot.
 redis.call('HSET', job_key, 'status', 'running')
 
 -- Record the lease: "this job is being worked on until <deadline>".
 -- If the worker finishes, ack removes this entry. If the worker dies,
 -- the entry outlives it, the deadline passes, and the reaper moves the
--- id back to the ready queue. This one zset entry is what makes a
+-- id back to its priority lane. This one zset entry is what makes a
 -- crashed worker's job recoverable instead of lost.
 local deadline = now + tonumber(ARGV[1])
-redis.call('ZADD', KEYS[2], deadline, id)
+redis.call('ZADD', KEYS[4], deadline, id)
 
 -- Give the worker everything it needs in a single round-trip:
 -- the id, the immutable payload, and the authoritative attempt number.

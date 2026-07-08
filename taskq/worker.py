@@ -1,15 +1,19 @@
 """The worker: claims jobs under a lease, runs them, acks or fails them.
 
-Run continuously (the real mode):   python -m taskq.worker [--queue NAME]
-Drain the ready queue, then exit:    python -m taskq.worker --burst
+Run continuously:  python -m taskq.worker [--queue NAME] [--concurrency N]
+Drain, then exit:  python -m taskq.worker --burst
 """
 import argparse
 import logging
+import os
 import signal
+import socket
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from .broker import Broker
 from .config import load_config
+from .heartbeat import Heartbeat
 from .job import Job
 from .reaper import Reaper
 from .redis_client import make_redis
@@ -19,38 +23,83 @@ log = logging.getLogger("taskq.worker")
 
 
 class Worker:
-    def __init__(self, broker: Broker, burst: bool = False):
+    def __init__(self, broker: Broker, burst: bool = False,
+                 concurrency: int = 1):
         self.broker = broker
         # burst=True: process whatever is ready now, then exit (demos/tests).
         # Note: burst does not wait for scheduled retries to become due.
         self.burst = burst
+        # THREADS, deliberately: queue jobs are overwhelmingly I/O-bound
+        # (network calls, DB writes, sleeps), where Python threads give real
+        # parallelism because the GIL is released while blocked on I/O.
+        # CPU-bound work should scale with worker PROCESSES instead (also
+        # supported: just start more `python -m taskq.worker`) - that split
+        # is exactly how Sidekiq (threads) vs. resque (processes) differ.
+        self.concurrency = max(1, concurrency)
+        self._pool = ThreadPoolExecutor(max_workers=self.concurrency,
+                                        thread_name_prefix="taskq-exec")
+        self._futures: set = set()
         self._running = False
 
     def stop(self) -> None:
         # Graceful shutdown = stop CLAIMING new work, never abandon work in
-        # progress. The current job (if any) finishes and acks before the
-        # loop exits. A hard kill mid-job is survivable anyway (lease +
-        # reaper), but exiting gracefully avoids pointless duplicate runs.
+        # progress. In-flight jobs finish and ack before run() returns. A
+        # hard kill mid-job is survivable anyway (lease + reaper), but
+        # exiting gracefully avoids pointless duplicate runs.
         self._running = False
 
     def run(self) -> None:
         self._running = True
         cfg = self.broker.cfg
-        log.info("worker started on queue '%s' (burst=%s, lease=%.0fs)",
-                 self.broker.queue_name, self.burst, cfg.lease_seconds)
-        while self._running:
-            job = self.broker.claim()
-            if job is None:
-                if self.burst:
-                    log.info("queue empty - burst worker exiting")
-                    break
-                # The atomic claim is a Lua script, and scripts cannot block
-                # the way BRPOP does. So the worker polls on a short sleep:
-                # the price of a race-free claim is a little idle latency
-                # (bounded by poll_interval) instead of a lost-job window.
-                time.sleep(cfg.poll_interval)
-                continue
-            self._process(job)
+        log.info("worker started on queue '%s' (burst=%s, concurrency=%d, "
+                 "lease=%.0fs)", self.broker.queue_name, self.burst,
+                 self.concurrency, cfg.lease_seconds)
+        try:
+            while self._running:
+                self._collect_finished()
+                if len(self._futures) >= self.concurrency:
+                    # All executor threads busy: claiming more now would only
+                    # sit in memory while its lease burns down. Wait for a
+                    # slot instead - backpressure, not buffering.
+                    wait(self._futures, timeout=0.2,
+                         return_when=FIRST_COMPLETED)
+                    continue
+                job = self.broker.claim()
+                if job is None:
+                    if self.burst:
+                        if self._futures:  # queue empty but work still running
+                            wait(self._futures, timeout=0.2,
+                                 return_when=FIRST_COMPLETED)
+                            continue
+                        log.info("queue drained - burst worker exiting")
+                        break
+                    # The atomic claim is a Lua script, and scripts cannot
+                    # block the way BRPOP does. So the worker polls on a
+                    # short sleep: the price of a race-free claim is a little
+                    # idle latency instead of a lost-job window.
+                    time.sleep(cfg.poll_interval)
+                    continue
+                self._futures.add(self._pool.submit(self._process, job))
+        finally:
+            # Drain: let every claimed job finish + ack before we return.
+            if self._futures:
+                log.info("waiting for %d in-flight job(s) to finish",
+                         len(self._futures))
+                wait(self._futures)
+                self._collect_finished()
+            self._pool.shutdown(wait=True)
+
+    def _collect_finished(self) -> None:
+        done = {f for f in self._futures if f.done()}
+        self._futures -= done
+        for f in done:
+            # Job-level exceptions are handled inside _process; anything
+            # surfacing here is infrastructure trouble (e.g. Redis down
+            # during ack) and must be visible, not silently swallowed.
+            exc = f.exception()
+            if exc is not None:
+                log.error("executor task crashed outside job handling: %r",
+                          exc)
 
     def _process(self, job: Job) -> None:
         total_allowed = job.max_retries + 1  # first run + retries
@@ -84,6 +133,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="process all currently ready jobs, then exit")
     parser.add_argument("--queue", default="default",
                         help="queue name to consume from")
+    parser.add_argument("--concurrency", type=int, default=1,
+                        help="number of jobs this worker runs in parallel "
+                             "(threads; best for I/O-bound tasks)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -97,12 +149,19 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config()
     broker = Broker(make_redis(config), config, queue_name=args.queue)
-    worker = Worker(broker, burst=args.burst)
+    worker = Worker(broker, burst=args.burst, concurrency=args.concurrency)
     reaper = Reaper(broker, interval=config.reaper_interval)
+    worker_id = f"{socket.gethostname().lower()}-{os.getpid()}"
+    heartbeat = Heartbeat(broker, worker_id, config.heartbeat_interval, info={
+        "pid": os.getpid(),
+        "queue": args.queue,
+        "concurrency": max(1, args.concurrency),
+        "burst": args.burst,
+    })
 
     def _request_stop(signum, frame):
-        log.info("signal %s received - finishing current job, then exiting",
-                 signum)
+        log.info("signal %s received - finishing in-flight jobs, then "
+                 "exiting", signum)
         worker.stop()
 
     # SIGINT = Ctrl+C, works everywhere. SIGTERM is the standard polite-kill
@@ -116,9 +175,11 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     reaper.start_thread()
+    heartbeat.start_thread()
     try:
         worker.run()
     finally:
+        heartbeat.stop()
         reaper.stop()
     return 0
 
