@@ -22,6 +22,7 @@ import redis
 
 from .config import Config
 from .job import Job, JobStatus
+from .metrics import Metrics
 from .retry import backoff_delay
 
 log = logging.getLogger("taskq.broker")
@@ -60,6 +61,10 @@ class Broker:
             (_SCRIPTS_DIR / "promote.lua").read_text())
         self._release_script = redis_conn.register_script(
             (_SCRIPTS_DIR / "release.lua").read_text())
+        self._replay_script = redis_conn.register_script(
+            (_SCRIPTS_DIR / "replay.lua").read_text())
+
+        self.metrics = Metrics(redis_conn, config, queue_name)
 
     def job_key(self, job_id: str) -> str:
         return f"{self.job_prefix}{job_id}"
@@ -146,8 +151,9 @@ class Broker:
         job.id = job_id  # defensive: the popped id is authoritative
         return job
 
-    def ack(self, job: Job) -> None:
+    def ack(self, job: Job, duration_seconds: float = 0.0) -> None:
         """Success: release the lease and delete the payload."""
+        self.metrics.record_success(duration_seconds)
         pipe = self.r.pipeline(transaction=True)
         pipe.zrem(self.key_inflight, job.id)
         # Completed payloads are deleted rather than kept: a result/history
@@ -186,6 +192,9 @@ class Broker:
             if removed == 0:
                 log.warning("fail: lease for %s was already reclaimed; "
                             "duplicate execution possible", job.id)
+            # Recorded here (not in bury) so each failure counts exactly
+            # once: this path retries, the bury path below records 'dead'.
+            self.metrics.record_failure("retried")
             log.info("job %s attempt %d/%d failed (%s); retrying in %.2fs",
                      job.id, job.attempts, job.max_retries + 1,
                      job.error, delay)
@@ -208,6 +217,7 @@ class Broker:
         })
         pipe.lpush(self.key_dead, job.id)
         pipe.execute()
+        self.metrics.record_failure("dead")
         # Dead is a terminal state: free the idempotency slot so the caller
         # can deliberately enqueue a fresh instance (e.g. after a fix).
         self._release_idem(job)
@@ -224,9 +234,14 @@ class Broker:
 
     def requeue_expired(self, batch: int = 100) -> int:
         """Move jobs whose lease deadline passed back to their lanes."""
-        return int(self._promote_script(
+        recovered = int(self._promote_script(
             keys=[self.key_inflight],
             args=[batch, self.job_prefix, self.lane_prefix]))
+        if recovered:
+            # 'recovered' is the headline reliability number: how many jobs
+            # a crashed worker would have lost without the lease + reaper.
+            self.metrics.incr("recovered", recovered)
+        return recovered
 
     def promote_scheduled(self, batch: int = 100) -> int:
         """Move due scheduled jobs (retries + delayed) back to their lanes."""
@@ -275,6 +290,87 @@ class Broker:
 
     def dead_ids(self) -> list[str]:
         return self.r.lrange(self.key_dead, 0, -1)
+
+    # ---- dead-letter operations (driven by the dashboard) -------------------
+
+    def replay_dead(self, job_id: str) -> str:
+        """Move one dead job back to its lane with a fresh retry budget.
+
+        Returns 'replayed', 'not_found' (not on the dead list - e.g. a
+        double click already took it), or 'payload_missing'.
+        """
+        result = int(self._replay_script(
+            keys=[self.key_dead],
+            args=[job_id, self.job_prefix, self.lane_prefix]))
+        if result == 1:
+            self.metrics.incr("replayed")
+            log.info("job %s replayed from the dead-letter queue", job_id)
+            return "replayed"
+        if result == -1:
+            log.warning("job %s could not be replayed: payload missing",
+                        job_id)
+            return "payload_missing"
+        return "not_found"
+
+    def replay_all_dead(self, limit: int = 500) -> dict:
+        outcomes = {"replayed": 0, "not_found": 0, "payload_missing": 0}
+        for job_id in self.dead_ids()[:limit]:
+            outcomes[self.replay_dead(job_id)] += 1
+        return outcomes
+
+    def discard_dead(self, job_id: str) -> bool:
+        """Permanently drop a dead job (operator decided it's not wanted)."""
+        pipe = self.r.pipeline(transaction=True)
+        pipe.lrem(self.key_dead, 0, job_id)
+        pipe.delete(self.job_key(job_id))
+        removed, _ = pipe.execute()
+        if removed:
+            log.info("job %s discarded from the dead-letter queue", job_id)
+        return bool(removed)
+
+    def dead_jobs(self, limit: int = 50) -> list[dict]:
+        """Dead jobs with enough detail for an operator to triage them."""
+        rows = []
+        for job_id in self.dead_ids()[:limit]:
+            fields = self.r.hgetall(self.job_key(job_id))
+            if not fields or "data" not in fields:
+                # Payload deleted out from under the dead list; surface it
+                # rather than hiding the inconsistency from the operator.
+                rows.append({"id": job_id, "type": "<payload missing>",
+                             "attempts": 0, "error": "payload deleted",
+                             "priority": "normal", "args": [], "kwargs": {}})
+                continue
+            job = Job.from_hash(fields["data"],
+                                attempts=fields.get("attempts", 0),
+                                status=fields.get("status") or None,
+                                error=fields.get("error") or None)
+            rows.append({
+                "id": job_id,
+                "type": job.type,
+                "attempts": job.attempts,
+                "error": job.error or "",
+                "priority": job.priority,
+                "args": job.args,
+                "kwargs": job.kwargs,
+                "created_at": job.created_at,
+                "updated_at": job.updated_at,
+            })
+        return rows
+
+    def stats(self) -> dict:
+        """One-shot snapshot for the dashboard."""
+        lanes = self.lane_depths()
+        return {
+            "queue": self.queue_name,
+            "lanes": lanes,
+            "ready": sum(lanes.values()),
+            "inflight": self.inflight_count(),
+            "scheduled": self.scheduled_count(),
+            "dead": self.dead_count(),
+            "counters": self.metrics.counters(),
+            "latency": self.metrics.latency(),
+            "workers": self.live_workers(),
+        }
 
     def load_job(self, job_id: str) -> Job | None:
         fields = self.r.hgetall(self.job_key(job_id))

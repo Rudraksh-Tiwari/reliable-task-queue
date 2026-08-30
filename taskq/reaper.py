@@ -29,6 +29,9 @@ class Reaper:
         self._thread: threading.Thread | None = None
 
     def run_once(self) -> tuple[int, int]:
+        # requeue_expired records the 'recovered' metric itself; promotion
+        # of due retries/delays is normal scheduling, not a recovery, so it
+        # is deliberately not counted as one.
         recovered = self.broker.requeue_expired()
         promoted = self.broker.promote_scheduled()
         if recovered:

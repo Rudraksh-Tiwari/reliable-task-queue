@@ -59,6 +59,19 @@ def incr(key: str) -> int:
 
 
 @task
+def flaky(gate_key: str, marker_key: str) -> str:
+    # Fails while `gate_key` exists, succeeds once it's cleared. Models the
+    # real dead-letter workflow: a job dies from a broken dependency, an
+    # operator fixes the dependency, then replays the job from the
+    # dashboard and it goes through.
+    r = make_redis(load_config())
+    if r.exists(gate_key):
+        raise RuntimeError("dependency unavailable")
+    r.set(marker_key, "1")
+    return "completed after the fix"
+
+
+@task
 def record(label: str, list_key: str) -> int:
     # Appends a label to a results list - execution order made observable.
     # The priority test asserts all "high" labels precede all "normal", etc.

@@ -5,7 +5,7 @@ first principles. The point of the project is the **reliability machinery** —
 atomic job claim, crash recovery, retries with backoff, and a dead-letter
 queue — written by hand rather than delegated to an existing job-queue library.
 
-> Status: Stage 3 of 6 complete — concurrent workers, priorities, delayed jobs, idempotency. See [Roadmap](#roadmap).
+> Status: Stage 4 of 6 complete — live dashboard, metrics, and dead-letter replay. See [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -72,6 +72,7 @@ A job id lives in exactly one structure at a time; atomic operations move it:
 | `taskq:job:<id>` | hash | payload (`data`) + mutable `attempts`/`status`/`error`/`priority` |
 | `taskq:idem:<key>` | string | active job id holding this idempotency slot (TTL'd) |
 | `taskq:worker:<id>` | string | worker heartbeat info; liveness = key exists (TTL'd) |
+| `taskq:metrics:<name>:*` | hash | fleet-wide counters, latency histogram, throughput buckets |
 
 The mechanisms, each hand-written:
 
@@ -130,6 +131,45 @@ delayed delivery, idempotent dedup):
 python -m taskq.verify_stage3
 ```
 
+## Observability (Stage 4)
+
+A live dashboard at `http://127.0.0.1:8000` showing queue depth per priority
+lane, in-flight and scheduled counts, throughput over time, execution-time
+stats, the worker registry, and the dead-letter queue with **replay** and
+**discard** controls.
+
+```bash
+python -m taskq.demo_seed --reset     # optional: seed a realistic mix
+python -m taskq.worker --concurrency 4
+python -m taskq.api                   # then open http://127.0.0.1:8000
+```
+
+- **Metrics live in Redis, not in the worker process.** Client libraries
+  keep counters in process memory, so with a fleet of workers every counter
+  describes one worker, scrapes hit a random one, and restarts reset them.
+  Aggregating in Redis ([metrics.py](taskq/metrics.py)) gives one fleet-wide
+  truth that survives restarts, and `HINCRBY` makes concurrent updates safe.
+- **Execution time** is tracked as a cumulative histogram (Prometheus-style
+  buckets) so a p95 can be estimated without storing every observation.
+- **Throughput** is bucketed into 5-second slots with a TTL, so chart
+  history evicts itself — no cleanup job.
+- **`GET /metrics`** exposes standard Prometheus exposition format, written
+  by hand — the format is plain text, so a client library would only add a
+  dependency and reintroduce the per-process problem above.
+- **Dead-letter replay** ([replay.lua](taskq/scripts/replay.lua)) returns a
+  job to its own priority lane with a fresh retry budget. `LREM` acts as an
+  atomic gate, so two operators double-clicking replay cannot requeue the
+  same job twice.
+- **The dashboard runs no jobs.** It is a pure observer, so it can be
+  restarted, scaled, or killed without touching job processing.
+
+Prove it (metrics accuracy, page render, Prometheus format, replay round
+trip, double-click safety):
+
+```bash
+python -m taskq.verify_stage4
+```
+
 ## Project layout
 
 ```
@@ -147,15 +187,22 @@ reliable-task-queue/
     ├── scripts/
     │   ├── claim.lua       # atomic pop + lease + attempt-count (the heart)
     │   └── promote.lua     # atomic "move due ids from zset to queue"
+    │   └── replay.lua      # atomic dead-letter replay (LREM as the gate)
     ├── retry.py            # capped exponential backoff + jitter
     ├── reaper.py           # recovery thread: expired leases + due retries/delays
     ├── heartbeat.py        # worker presence via TTL'd keys
+    ├── metrics.py          # fleet-wide counters/histogram/throughput in Redis
     ├── worker.py           # the worker loop (thread-pool concurrency)
+    ├── api.py              # FastAPI dashboard + JSON API + /metrics
+    ├── static/
+    │   └── dashboard.html  # self-contained live dashboard (no CDN)
     ├── example_tasks.py    # demo tasks
     ├── enqueue_demo.py     # demo producer
+    ├── demo_seed.py        # seeds a realistic mix for the dashboard
     ├── smoke.py            # Stage 0 verification
     ├── verify_stage2.py    # Stage 2 proof: crash recovery + DLQ, automated
-    └── verify_stage3.py    # Stage 3 proof: contention/throughput/priority/delay/idem
+    ├── verify_stage3.py    # Stage 3 proof: contention/throughput/priority/delay/idem
+    └── verify_stage4.py    # Stage 4 proof: metrics/dashboard/prometheus/replay
 ```
 
 ## Roadmap
@@ -164,7 +211,7 @@ reliable-task-queue/
 - [x] **Stage 1 — MVP happy path:** `@task` registry, `enqueue()` onto a Redis list, single worker that runs jobs.
 - [x] **Stage 2 — Reliability core:** atomic claim (Lua), lease + reaper crash recovery, retries with backoff + jitter, dead-letter queue, automated chaos verification.
 - [x] **Stage 3 — Scale & scheduling:** thread-pool concurrency, strict priority lanes, delayed jobs, idempotency keys, worker heartbeats.
-- [ ] **Stage 4 — Observability:** metrics + web dashboard.
+- [x] **Stage 4 — Observability:** Redis-aggregated metrics, live web dashboard, Prometheus endpoint, dead-letter replay.
 - [ ] **Stage 5 — Proof & polish:** load test, chaos test, docs, benchmarks.
 - [ ] **Stage 6 — Distributed (stretch):** multi-node workers.
 

@@ -114,6 +114,9 @@ class Worker:
             return
         log.info("running job %s (%s) attempt %d/%d",
                  job.id, job.type, job.attempts, total_allowed)
+        # Measure only the HANDLER, not the surrounding Redis bookkeeping,
+        # so the latency metric reflects how long the actual work takes.
+        started = time.monotonic()
         try:
             # Handler lookup happens inside the try: a job naming an
             # unregistered task follows the normal failure path (retry, then
@@ -123,7 +126,7 @@ class Worker:
         except Exception as exc:
             self.broker.fail(job, exc)
             return
-        self.broker.ack(job)
+        self.broker.ack(job, duration_seconds=time.monotonic() - started)
         log.info("job %s done -> %r", job.id, result)
 
 

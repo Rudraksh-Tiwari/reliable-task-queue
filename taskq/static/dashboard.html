@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>taskq &middot; queue dashboard</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel-2: #1c2128;
+    --border: #30363d; --text: #e6edf3; --muted: #8b949e; --dim: #6e7681;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --accent: #58a6ff;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 14px; line-height: 1.5; padding: 24px;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding-bottom: 16px; border-bottom: 1px solid var(--border);
+    margin-bottom: 20px; flex-wrap: wrap; gap: 12px;
+  }
+  h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+  h1 span { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 13px; }
+  .live { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  .dot.stale { background: var(--err); }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+       color: var(--muted); font-weight: 600; margin-bottom: 10px; }
+  .grid { display: grid; gap: 12px; margin-bottom: 24px; }
+  .cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+  .card .value { font-size: 28px; font-weight: 600; font-family: var(--mono); margin-top: 4px; line-height: 1.1; }
+  .card .sub { font-size: 11px; color: var(--dim); font-family: var(--mono); margin-top: 6px; }
+  .v-ok { color: var(--ok); } .v-warn { color: var(--warn); }
+  .v-err { color: var(--err); } .v-accent { color: var(--accent); }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+  .two { grid-template-columns: 2fr 1fr; }
+  @media (max-width: 860px) { .two { grid-template-columns: 1fr; } }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+       color: var(--muted); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  td { padding: 8px; border-bottom: 1px solid var(--panel-2); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .err-text { color: var(--err); font-family: var(--mono); font-size: 12px;
+              max-width: 320px; overflow-wrap: anywhere; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.danger:hover { border-color: var(--err); color: var(--err); }
+  button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  button.primary:hover { background: #2ea043; color: #fff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 12px; }
+  .empty { color: var(--dim); font-size: 13px; padding: 16px 8px; text-align: center; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 11px;
+          font-family: var(--mono); border: 1px solid var(--border); color: var(--muted); }
+  .pill.high { color: var(--err); border-color: var(--err); }
+  .pill.low { color: var(--dim); }
+  .legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; }
+  .kv { display: flex; justify-content: space-between; padding: 5px 0; font-size: 13px; }
+  .kv + .kv { border-top: 1px solid var(--panel-2); }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-family: var(--mono); }
+  #toast {
+    position: fixed; bottom: 20px; right: 20px; background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px 16px;
+    font-size: 13px; opacity: 0; transition: opacity 0.2s; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>taskq <span id="queue-name">&middot; default</span></h1>
+    <div class="live"><span class="dot" id="dot"></span><span id="live-text">connecting</span></div>
+  </header>
+
+  <div class="grid cards" id="cards"></div>
+
+  <div class="grid two">
+    <div class="panel">
+      <div class="row">
+        <h2 style="margin:0">Throughput &middot; last 5 min</h2>
+        <div class="legend">
+          <span><i style="background:#3fb950"></i>succeeded</span>
+          <span><i style="background:#f85149"></i>failed</span>
+        </div>
+      </div>
+      <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"></svg>
+    </div>
+    <div class="panel">
+      <h2>Execution time</h2>
+      <div id="latency"></div>
+      <h2 style="margin-top:18px">Lifetime counters</h2>
+      <div id="counters"></div>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-bottom:24px">
+    <h2>Workers</h2>
+    <table><thead><tr>
+      <th>Worker</th><th>PID</th><th>Concurrency</th><th>Last heartbeat</th>
+    </tr></thead><tbody id="workers"></tbody></table>
+  </div>
+
+  <div class="panel">
+    <div class="row">
+      <h2 style="margin:0">Dead-letter queue <span id="dead-count" class="mono"></span></h2>
+      <button class="primary" id="replay-all">Replay all</button>
+    </div>
+    <table><thead><tr>
+      <th>Job</th><th>Task</th><th>Attempts</th><th>Error</th><th style="width:150px"></th>
+    </tr></thead><tbody id="dead"></tbody></table>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let failures = 0;
+
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove("show"), 2600);
+}
+
+function card(label, value, cls, sub) {
+  return `<div class="card"><div class="label">${label}</div>
+    <div class="value ${cls || ""}">${value}</div>
+    ${sub ? `<div class="sub">${sub}</div>` : ""}</div>`;
+}
+
+function renderStats(s) {
+  $("queue-name").textContent = "· " + s.queue;
+  const lanes = s.lanes || {};
+  $("cards").innerHTML = [
+    card("Ready", s.ready, "v-accent",
+         `high ${lanes.high || 0} · normal ${lanes.normal || 0} · low ${lanes.low || 0}`),
+    card("In flight", s.inflight, s.inflight ? "v-warn" : "", "leased to workers"),
+    card("Scheduled", s.scheduled, "", "retries + delayed"),
+    card("Dead", s.dead, s.dead ? "v-err" : "", "needs attention"),
+    card("Workers", (s.workers || []).length, "v-ok", "heartbeating"),
+  ].join("");
+
+  const lat = s.latency || {};
+  $("latency").innerHTML = [
+    ["Jobs measured", (lat.count || 0).toLocaleString()],
+    ["Average", (lat.avg_ms || 0).toFixed(1) + " ms"],
+    ["p95 (est.)", lat.p95_ms === null || !isFinite(lat.p95_ms)
+        ? "&gt; 10 s" : "≤ " + lat.p95_ms + " ms"],
+  ].map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`).join("");
+
+  const c = s.counters || {};
+  const colour = { succeeded: "v-ok", failed: "v-err", dead: "v-err",
+                   recovered: "v-accent", retried: "v-warn", replayed: "" };
+  $("counters").innerHTML = Object.keys(c).map(k =>
+    `<div class="kv"><span class="k">${k}</span>
+     <span class="v ${colour[k] || ""}">${c[k].toLocaleString()}</span></div>`).join("");
+
+  const ws = s.workers || [];
+  $("workers").innerHTML = ws.length ? ws.map(w => {
+    const age = w.last_beat ? (Date.now() / 1000 - w.last_beat) : null;
+    return `<tr><td class="mono">${w.worker_id}</td><td class="mono">${w.pid}</td>
+      <td class="mono">${w.concurrency}</td>
+      <td class="mono">${age === null ? "-" : age.toFixed(1) + "s ago"}</td></tr>`;
+  }).join("") : `<tr><td colspan="4" class="empty">No workers running</td></tr>`;
+}
+
+function renderChart(points) {
+  const svg = $("chart");
+  if (!points.length) { svg.innerHTML = ""; return; }
+  const W = 720, H = 180, pad = 4;
+  const max = Math.max(1, ...points.map(p => p.succeeded + p.failed));
+  const bw = W / points.length;
+  let out = "";
+  // Horizontal gridlines + max label.
+  for (let i = 1; i <= 3; i++) {
+    const y = H - (H - 20) * (i / 3);
+    out += `<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="#30363d" stroke-width="1"/>`;
+  }
+  out += `<text x="4" y="14" fill="#6e7681" font-size="11" font-family="monospace">${max}/bucket</text>`;
+  points.forEach((p, i) => {
+    const total = p.succeeded + p.failed;
+    if (!total) return;
+    const x = i * bw + pad / 2;
+    const w = Math.max(1, bw - pad);
+    const hOk = (H - 20) * (p.succeeded / max);
+    const hErr = (H - 20) * (p.failed / max);
+    if (hErr > 0) out += `<rect x="${x}" y="${H - hErr}" width="${w}" height="${hErr}" fill="#f85149"/>`;
+    if (hOk > 0) out += `<rect x="${x}" y="${H - hErr - hOk}" width="${w}" height="${hOk}" fill="#3fb950"/>`;
+  });
+  svg.innerHTML = out;
+}
+
+function renderDead(d) {
+  $("dead-count").textContent = d.total ? `(${d.total})` : "";
+  $("replay-all").disabled = !d.total;
+  $("dead").innerHTML = d.jobs.length ? d.jobs.map(j => `
+    <tr>
+      <td class="mono" title="${j.id}">${j.id.slice(0, 10)}
+        <span class="pill ${j.priority}">${j.priority}</span></td>
+      <td class="mono">${j.type}</td>
+      <td class="mono">${j.attempts}</td>
+      <td class="err-text">${(j.error || "").replace(/</g, "&lt;")}</td>
+      <td style="text-align:right;white-space:nowrap">
+        <button onclick="replayJob('${j.id}')">Replay</button>
+        <button class="danger" onclick="discardJob('${j.id}')">Discard</button>
+      </td>
+    </tr>`).join("") : `<tr><td colspan="5" class="empty">Dead-letter queue is empty</td></tr>`;
+}
+
+async function replayJob(id) {
+  const r = await fetch(`/api/dead/${id}/replay`, { method: "POST" });
+  toast(r.ok ? `Replayed ${id.slice(0, 10)}` : `Could not replay ${id.slice(0, 10)}`);
+  refresh();
+}
+async function discardJob(id) {
+  if (!confirm("Permanently discard this job? This cannot be undone.")) return;
+  const r = await fetch(`/api/dead/${id}`, { method: "DELETE" });
+  toast(r.ok ? `Discarded ${id.slice(0, 10)}` : "Could not discard");
+  refresh();
+}
+$("replay-all").onclick = async () => {
+  if (!confirm("Replay every job in the dead-letter queue?")) return;
+  const r = await fetch("/api/dead/replay-all", { method: "POST" });
+  const out = await r.json();
+  toast(`Replayed ${out.replayed} job(s)`);
+  refresh();
+};
+
+async function refresh() {
+  try {
+    const [s, tp, d] = await Promise.all([
+      fetch("/api/stats").then(r => r.json()),
+      fetch("/api/throughput?window=300").then(r => r.json()),
+      fetch("/api/dead?limit=50").then(r => r.json()),
+    ]);
+    renderStats(s); renderChart(tp.points); renderDead(d);
+    failures = 0;
+    $("dot").classList.remove("stale");
+    $("live-text").textContent = "live · " + new Date().toLocaleTimeString();
+  } catch (e) {
+    // Don't wipe the last good render on a blip - just mark it stale, so
+    // the operator can tell "nothing is happening" from "I lost the feed".
+    failures++;
+    $("dot").classList.add("stale");
+    $("live-text").textContent = `disconnected (${failures})`;
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
