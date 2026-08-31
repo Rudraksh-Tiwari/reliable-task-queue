@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+
+    # A real Redis alongside the job. The integration tests exercise the
+    # actual Lua scripts and atomic semantics - mocking Redis here would
+    # test nothing that matters, since the guarantees ARE Redis behaviour.
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run test suite
+        run: pytest -v
+
+  reliability:
+    name: reliability proofs
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # These spawn real worker processes and hard-kill them. They are the
+      # tests that actually prove the headline guarantee, so a regression
+      # in crash recovery fails the build rather than being noticed later.
+      - name: Crash recovery and dead-letter (stage 2)
+        run: python -m taskq.verify_stage2
+
+      - name: Concurrency, priority, scheduling, idempotency (stage 3)
+        run: python -m taskq.verify_stage3
+
+      - name: Metrics, dashboard, replay (stage 4)
+        run: python -m taskq.verify_stage4
+
+      - name: Chaos - kill workers at random, assert zero job loss
+        run: python -m taskq.chaostest --jobs 300 --workers 3 --kills 6
+
+      - name: Load - smaller batch to keep CI fast
+        run: python -m taskq.loadtest --jobs 2000 --workers 2 --concurrency 8

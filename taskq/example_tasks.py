@@ -10,6 +10,18 @@ from .config import load_config
 from .redis_client import make_redis
 from .registry import task
 
+# One connection per worker process, created on first use. Opening a fresh
+# connection inside every job would dominate the timings in the load test
+# and exhaust file descriptors at high concurrency.
+_conn = None
+
+
+def _redis():
+    global _conn
+    if _conn is None:
+        _conn = make_redis(load_config())
+    return _conn
+
 
 @task
 def send_email(to: str, subject: str = "Hello") -> str:
@@ -44,8 +56,7 @@ def slow_marker(seconds: float, key: str) -> str:
     # kill the worker mid-sleep, and the marker's later appearance proves
     # the job was recovered and re-run to completion by another worker.
     time.sleep(seconds)
-    r = make_redis(load_config())
-    r.set(key, "1")
+    _redis().set(key, "1")
     return f"marker {key} set"
 
 
@@ -54,8 +65,25 @@ def incr(key: str) -> int:
     # Increments a counter. The Stage 3 contention test enqueues one of
     # these per unique key across several competing workers: every counter
     # ending at exactly 1 proves no job was double-claimed OR lost.
-    # (A fresh connection per call is fine at demo scale.)
-    return make_redis(load_config()).incr(key)
+    return _redis().incr(key)
+
+
+@task
+def noop() -> None:
+    # Does nothing on purpose. The load test uses it so the measured
+    # throughput reflects the QUEUE's overhead (claim, ack, metrics) rather
+    # than whatever work a realistic handler would do.
+    return None
+
+
+@task
+def chaos_job(key: str, seconds: float = 0.1) -> int:
+    # Sleeps (so a worker can be killed mid-execution), then increments a
+    # per-job counter. After a chaos run, every counter existing proves
+    # ZERO LOSS; any counter above 1 is a duplicate execution, which
+    # at-least-once delivery explicitly permits and the test quantifies.
+    time.sleep(seconds)
+    return _redis().incr(key)
 
 
 @task
@@ -64,7 +92,7 @@ def flaky(gate_key: str, marker_key: str) -> str:
     # real dead-letter workflow: a job dies from a broken dependency, an
     # operator fixes the dependency, then replays the job from the
     # dashboard and it goes through.
-    r = make_redis(load_config())
+    r = _redis()
     if r.exists(gate_key):
         raise RuntimeError("dependency unavailable")
     r.set(marker_key, "1")
@@ -75,4 +103,4 @@ def flaky(gate_key: str, marker_key: str) -> str:
 def record(label: str, list_key: str) -> int:
     # Appends a label to a results list - execution order made observable.
     # The priority test asserts all "high" labels precede all "normal", etc.
-    return make_redis(load_config()).rpush(list_key, label)
+    return _redis().rpush(list_key, label)
