@@ -80,6 +80,10 @@
     font-size: 13px; opacity: 0; transition: opacity 0.2s; pointer-events: none;
   }
   #toast.show { opacity: 1; }
+  #toast.error { border-color: var(--err); }
+  .c-actions { text-align: right; white-space: nowrap; }
+  button:disabled:hover { border-color: var(--border); color: var(--text); }
+  button.primary:disabled:hover { background: #238636; border-color: #2ea043; color: #fff; }
 </style>
 </head>
 <body>
@@ -132,55 +136,91 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let failures = 0;
+// The dead-letter rows are rebuilt only when their contents change, so a
+// click (or keyboard focus) never lands on a button that a background
+// refresh has just replaced.
+let deadSignature = null;
+const busy = new Set();     // job ids with a replay/discard request in flight
+let replayAllBusy = false;
 
-function toast(msg) {
+// Every value from the API is written with textContent, never innerHTML:
+// task names, worker ids and errors come from job payloads, and treating
+// them as markup would let a crafted job run script in the operator's tab.
+function el(tag, className, text) {
+  const e = document.createElement(tag);
+  if (className) e.className = className;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function toast(msg, isError) {
   const t = $("toast");
   t.textContent = msg;
+  t.classList.toggle("error", Boolean(isError));
   t.classList.add("show");
   clearTimeout(t._timer);
-  t._timer = setTimeout(() => t.classList.remove("show"), 2600);
+  t._timer = setTimeout(() => t.classList.remove("show"), isError ? 5000 : 2600);
 }
 
 function card(label, value, cls, sub) {
-  return `<div class="card"><div class="label">${label}</div>
-    <div class="value ${cls || ""}">${value}</div>
-    ${sub ? `<div class="sub">${sub}</div>` : ""}</div>`;
+  const c = el("div", "card");
+  c.append(el("div", "label", label), el("div", "value " + (cls || ""), String(value)));
+  if (sub) c.append(el("div", "sub", sub));
+  return c;
+}
+
+function kv(k, v, cls) {
+  const row = el("div", "kv");
+  row.append(el("span", "k", k), el("span", "v " + (cls || ""), v));
+  return row;
+}
+
+function emptyRow(colspan, text) {
+  const tr = el("tr");
+  const td = el("td", "empty", text);
+  td.colSpan = colspan;
+  tr.append(td);
+  return tr;
 }
 
 function renderStats(s) {
   $("queue-name").textContent = "· " + s.queue;
   const lanes = s.lanes || {};
-  $("cards").innerHTML = [
+  $("cards").replaceChildren(
     card("Ready", s.ready, "v-accent",
          `high ${lanes.high || 0} · normal ${lanes.normal || 0} · low ${lanes.low || 0}`),
     card("In flight", s.inflight, s.inflight ? "v-warn" : "", "leased to workers"),
     card("Scheduled", s.scheduled, "", "retries + delayed"),
     card("Dead", s.dead, s.dead ? "v-err" : "", "needs attention"),
     card("Workers", (s.workers || []).length, "v-ok", "heartbeating"),
-  ].join("");
+  );
 
   const lat = s.latency || {};
-  $("latency").innerHTML = [
-    ["Jobs measured", (lat.count || 0).toLocaleString()],
-    ["Average", (lat.avg_ms || 0).toFixed(1) + " ms"],
-    ["p95 (est.)", lat.p95_ms === null || !isFinite(lat.p95_ms)
-        ? "&gt; 10 s" : "≤ " + lat.p95_ms + " ms"],
-  ].map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`).join("");
+  $("latency").replaceChildren(
+    kv("Jobs measured", (lat.count || 0).toLocaleString()),
+    kv("Average", (lat.avg_ms || 0).toFixed(1) + " ms"),
+    kv("p95 (est.)", lat.p95_ms === null || !isFinite(lat.p95_ms)
+        ? "> 10 s" : "≤ " + lat.p95_ms + " ms"),
+  );
 
   const c = s.counters || {};
   const colour = { succeeded: "v-ok", failed: "v-err", dead: "v-err",
                    recovered: "v-accent", retried: "v-warn", replayed: "" };
-  $("counters").innerHTML = Object.keys(c).map(k =>
-    `<div class="kv"><span class="k">${k}</span>
-     <span class="v ${colour[k] || ""}">${c[k].toLocaleString()}</span></div>`).join("");
+  $("counters").replaceChildren(...Object.keys(c).map(k =>
+    kv(k, Number(c[k]).toLocaleString(), colour[k])));
 
   const ws = s.workers || [];
-  $("workers").innerHTML = ws.length ? ws.map(w => {
+  $("workers").replaceChildren(...(ws.length ? ws.map(w => {
     const age = w.last_beat ? (Date.now() / 1000 - w.last_beat) : null;
-    return `<tr><td class="mono">${w.worker_id}</td><td class="mono">${w.pid}</td>
-      <td class="mono">${w.concurrency}</td>
-      <td class="mono">${age === null ? "-" : age.toFixed(1) + "s ago"}</td></tr>`;
-  }).join("") : `<tr><td colspan="4" class="empty">No workers running</td></tr>`;
+    const tr = el("tr");
+    tr.append(
+      el("td", "mono", w.worker_id),
+      el("td", "mono", String(w.pid)),
+      el("td", "mono", String(w.concurrency)),
+      el("td", "mono", age === null ? "-" : age.toFixed(1) + "s ago"),
+    );
+    return tr;
+  }) : [emptyRow(4, "No workers running")]));
 }
 
 function renderChart(points) {
@@ -189,6 +229,7 @@ function renderChart(points) {
   const W = 720, H = 180, pad = 4;
   const max = Math.max(1, ...points.map(p => p.succeeded + p.failed));
   const bw = W / points.length;
+  // Only numbers computed here go into this markup, never API strings.
   let out = "";
   // Horizontal gridlines + max label.
   for (let i = 1; i <= 3; i++) {
@@ -209,48 +250,133 @@ function renderChart(points) {
   svg.innerHTML = out;
 }
 
+function actionButton(label, action, id, extraClass) {
+  const b = el("button", extraClass, label);
+  b.type = "button";
+  b.dataset.action = action;
+  b.dataset.id = id;
+  b.disabled = busy.has(id);
+  return b;
+}
+
+function deadRow(j) {
+  const tr = el("tr");
+  tr.dataset.id = j.id;
+  const idCell = el("td", "mono", j.id.slice(0, 10));
+  idCell.title = j.id;
+  idCell.append(" ", el("span", "pill " + j.priority, j.priority));
+  const actions = el("td", "c-actions");
+  actions.append(actionButton("Replay", "replay", j.id, ""), " ",
+                 actionButton("Discard", "discard", j.id, "danger"));
+  tr.append(idCell, el("td", "mono", j.type), el("td", "mono", String(j.attempts)),
+            el("td", "err-text", j.error || ""), actions);
+  return tr;
+}
+
 function renderDead(d) {
   $("dead-count").textContent = d.total ? `(${d.total})` : "";
-  $("replay-all").disabled = !d.total;
-  $("dead").innerHTML = d.jobs.length ? d.jobs.map(j => `
-    <tr>
-      <td class="mono" title="${j.id}">${j.id.slice(0, 10)}
-        <span class="pill ${j.priority}">${j.priority}</span></td>
-      <td class="mono">${j.type}</td>
-      <td class="mono">${j.attempts}</td>
-      <td class="err-text">${(j.error || "").replace(/</g, "&lt;")}</td>
-      <td style="text-align:right;white-space:nowrap">
-        <button onclick="replayJob('${j.id}')">Replay</button>
-        <button class="danger" onclick="discardJob('${j.id}')">Discard</button>
-      </td>
-    </tr>`).join("") : `<tr><td colspan="5" class="empty">Dead-letter queue is empty</td></tr>`;
+  $("replay-all").disabled = !d.total || replayAllBusy;
+  const signature = d.jobs.map(j => `${j.id}:${j.attempts}:${j.error}`).join("|");
+  if (signature === deadSignature) return;
+  deadSignature = signature;
+  // Keep keyboard focus on the same button if its row survives the rebuild.
+  const a = document.activeElement;
+  const keep = a && $("dead").contains(a) && a.dataset.action ? [a.dataset.action, a.dataset.id] : null;
+  $("dead").replaceChildren(...(d.jobs.length ? d.jobs.map(deadRow)
+                                              : [emptyRow(5, "Dead-letter queue is empty")]));
+  if (keep) {
+    for (const b of $("dead").querySelectorAll("button[data-action]")) {
+      if (b.dataset.action === keep[0] && b.dataset.id === keep[1]) { b.focus(); break; }
+    }
+  }
+}
+
+function setBusy(id, on) {
+  if (on) busy.add(id); else busy.delete(id);
+  for (const tr of $("dead").rows) {
+    if (tr.dataset.id !== id) continue;
+    for (const b of tr.querySelectorAll("button")) b.disabled = on;
+  }
+}
+
+async function errorDetail(r) {
+  try {
+    const body = await r.json();
+    if (body && typeof body.detail === "string") return body.detail;
+  } catch (e) { /* not JSON */ }
+  return `HTTP ${r.status}`;
+}
+
+const UNREACHABLE = "the API is unreachable. Try again once the dashboard reconnects.";
+
+async function runJobAction(id, verb, request) {
+  const short = id.slice(0, 10);
+  setBusy(id, true);
+  try {
+    const r = await request();
+    if (r.ok) {
+      toast(`${verb === "replay" ? "Replayed" : "Discarded"} ${short}`);
+    } else if (r.status === 404) {
+      // Expected after a double click or a second operator: the job already
+      // left the dead-letter queue, and the server refused to act twice.
+      toast(`${short} was already replayed or discarded`);
+    } else {
+      toast(`Could not ${verb} ${short}: ${await errorDetail(r)}`, true);
+    }
+  } catch (e) {
+    toast(`Could not ${verb} ${short}: ${UNREACHABLE}`, true);
+  } finally {
+    setBusy(id, false);
+    deadSignature = null;
+    refresh();
+  }
 }
 
 async function replayJob(id) {
-  const r = await fetch(`/api/dead/${id}/replay`, { method: "POST" });
-  toast(r.ok ? `Replayed ${id.slice(0, 10)}` : `Could not replay ${id.slice(0, 10)}`);
-  refresh();
+  await runJobAction(id, "replay", () => fetch(`/api/dead/${id}/replay`, { method: "POST" }));
 }
 async function discardJob(id) {
   if (!confirm("Permanently discard this job? This cannot be undone.")) return;
-  const r = await fetch(`/api/dead/${id}`, { method: "DELETE" });
-  toast(r.ok ? `Discarded ${id.slice(0, 10)}` : "Could not discard");
-  refresh();
+  await runJobAction(id, "discard", () => fetch(`/api/dead/${id}`, { method: "DELETE" }));
 }
+$("dead").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-action]");
+  if (!b || b.disabled) return;
+  if (b.dataset.action === "replay") replayJob(b.dataset.id);
+  else discardJob(b.dataset.id);
+});
 $("replay-all").onclick = async () => {
   if (!confirm("Replay every job in the dead-letter queue?")) return;
-  const r = await fetch("/api/dead/replay-all", { method: "POST" });
-  const out = await r.json();
-  toast(`Replayed ${out.replayed} job(s)`);
-  refresh();
+  replayAllBusy = true;
+  $("replay-all").disabled = true;
+  try {
+    const r = await fetch("/api/dead/replay-all", { method: "POST" });
+    if (r.ok) {
+      const out = await r.json();
+      toast(`Replayed ${out.replayed} job(s)`);
+    } else {
+      toast(`Could not replay the dead-letter queue: ${await errorDetail(r)}`, true);
+    }
+  } catch (e) {
+    toast(`Could not replay the dead-letter queue: ${UNREACHABLE}`, true);
+  } finally {
+    replayAllBusy = false;
+    deadSignature = null;
+    refresh();
+  }
 };
+
+function readJson(r) {
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}
 
 async function refresh() {
   try {
     const [s, tp, d] = await Promise.all([
-      fetch("/api/stats").then(r => r.json()),
-      fetch("/api/throughput?window=300").then(r => r.json()),
-      fetch("/api/dead?limit=50").then(r => r.json()),
+      fetch("/api/stats").then(readJson),
+      fetch("/api/throughput?window=300").then(readJson),
+      fetch("/api/dead?limit=50").then(readJson),
     ]);
     renderStats(s); renderChart(tp.points); renderDead(d);
     failures = 0;
