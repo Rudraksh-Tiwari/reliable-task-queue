@@ -63,6 +63,8 @@ class Broker:
             (_SCRIPTS_DIR / "release.lua").read_text())
         self._replay_script = redis_conn.register_script(
             (_SCRIPTS_DIR / "replay.lua").read_text())
+        self._discard_script = redis_conn.register_script(
+            (_SCRIPTS_DIR / "discard.lua").read_text())
 
         self.metrics = Metrics(redis_conn, config, queue_name)
 
@@ -319,11 +321,16 @@ class Broker:
         return outcomes
 
     def discard_dead(self, job_id: str) -> bool:
-        """Permanently drop a dead job (operator decided it's not wanted)."""
-        pipe = self.r.pipeline(transaction=True)
-        pipe.lrem(self.key_dead, 0, job_id)
-        pipe.delete(self.job_key(job_id))
-        removed, _ = pipe.execute()
+        """Permanently drop a dead job (operator decided it's not wanted).
+
+        Returns False, and changes nothing, if the id is not on the dead
+        list - e.g. a concurrent replay already put it back in its lane.
+        The check and the delete are one script (see discard.lua for the
+        job-losing race a plain LREM + DEL pipeline allowed).
+        """
+        removed = int(self._discard_script(
+            keys=[self.key_dead, self.job_key(job_id)],
+            args=[job_id]))
         if removed:
             log.info("job %s discarded from the dead-letter queue", job_id)
         return bool(removed)

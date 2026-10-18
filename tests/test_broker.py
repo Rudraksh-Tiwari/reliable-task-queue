@@ -174,6 +174,31 @@ def test_discard_removes_a_dead_job_permanently(broker):
     assert broker.discard_dead(job.id) is False
 
 
+def test_discard_after_a_replay_leaves_the_requeued_job_intact(broker):
+    # Two operators: one clicks replay, the other clicks discard a moment
+    # later. Replay wins, so the discard must be a no-op. It must not delete
+    # the payload of a job that is already back in its lane, or claim.lua
+    # silently drops the orphaned id and the job is lost.
+    job = Job(type="noop", max_retries=0)
+    broker.enqueue(job)
+    broker.fail(broker.claim(), RuntimeError("boom"))
+    assert broker.replay_dead(job.id) == "replayed"
+
+    assert broker.discard_dead(job.id) is False
+    assert broker.load_job(job.id) is not None, "payload of a live job deleted"
+    claimed = broker.claim()
+    assert claimed is not None and claimed.id == job.id
+
+
+def test_discard_of_a_job_that_is_not_dead_changes_nothing(broker):
+    # The API takes any id. Discarding a queued job's id must not touch it.
+    job = Job(type="noop")
+    broker.enqueue(job)
+    assert broker.discard_dead(job.id) is False
+    assert broker.load_job(job.id) is not None
+    assert broker.claim().id == job.id
+
+
 def test_dead_jobs_listing_carries_triage_detail(broker):
     job = Job(type="always_fail", args=["ctx"], max_retries=0)
     broker.enqueue(job)

@@ -96,6 +96,38 @@ def test_concurrent_replay_requeues_once(broker):
     assert broker.queue_depth() == 1
 
 
+def test_concurrent_replay_and_discard_never_queue_a_job_without_its_payload(broker):
+    # The dashboard's replay and discard buttons, clicked on the same dead job
+    # from two tabs. Either outcome is acceptable: the job is back in its
+    # lane with its payload, or it is gone entirely. A queued id whose payload
+    # was deleted is a lost job. Repeated because one round only hits the bad
+    # ordering (replay first, then discard) about half the time.
+    for _ in range(30):
+        job = Job(type="noop", max_retries=0)
+        broker.enqueue(job)
+        broker.fail(broker.claim(), RuntimeError("boom"))
+
+        actions = iter([lambda: broker.replay_dead(job.id),
+                        lambda: broker.discard_dead(job.id)])
+        lock = threading.Lock()
+
+        def act():
+            with lock:
+                action = next(actions)
+            return action()
+
+        run_concurrently(act, threads=2)
+        assert broker.dead_count() == 0
+        if broker.queue_depth():
+            assert broker.load_job(job.id) is not None, \
+                "replayed job is queued but its payload was discarded"
+            claimed = broker.claim()
+            assert claimed.id == job.id
+            broker.ack(claimed)
+        else:
+            assert broker.load_job(job.id) is None
+
+
 def test_concurrent_ack_and_recovery_do_not_lose_the_payload(broker):
     # A worker acking at the same moment reapers sweep: the job must end up
     # gone (acked), never stuck half-deleted.
