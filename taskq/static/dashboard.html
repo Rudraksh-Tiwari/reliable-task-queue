@@ -533,7 +533,18 @@ function readJson(r) {
   return r.json();
 }
 
+// Polling: each request is scheduled after the previous one finishes, so a
+// slow response can never overlap the next one, and polling stops while the
+// tab is hidden instead of queueing work nobody will see.
+const POLL_MS = 2000;
+let pollTimer = 0;
+let inFlight = false;
+let again = false;          // a refresh was asked for while one was running
+
 async function refresh() {
+  if (inFlight) { again = true; return; }
+  inFlight = true;
+  clearTimeout(pollTimer);
   try {
     const [s, tp, d] = await Promise.all([
       fetch("/api/stats").then(readJson),
@@ -566,11 +577,23 @@ async function refresh() {
     if (!lastOk) {
       for (const e of document.querySelectorAll(".loading")) e.textContent = "Waiting for the API…";
     }
+  } finally {
+    inFlight = false;
+    if (again) {
+      again = false;
+      refresh();
+    } else if (document.visibilityState === "visible") {
+      pollTimer = setTimeout(refresh, POLL_MS);
+    }
   }
 }
 
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") refresh();
+  else clearTimeout(pollTimer);
+});
+
 refresh();
-setInterval(refresh, 2000);
 </script>
 </body>
 </html>
