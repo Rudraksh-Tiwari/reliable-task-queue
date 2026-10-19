@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0d1117">
 <title>taskq &middot; queue dashboard</title>
 <style>
   :root {
@@ -19,7 +20,11 @@
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
   }
+  /* Dark native scrollbars and dialogs to match the page. */
+  :root { color-scheme: dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* One focus ring for every control, shown for keyboard focus only. */
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   body {
     background: var(--bg); color: var(--text);
     font-family: var(--sans);
