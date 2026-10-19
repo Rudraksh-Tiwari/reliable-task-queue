@@ -84,6 +84,44 @@
   #toast.show { opacity: 1; }
   #toast.error { border-color: var(--err); }
   .c-actions { text-align: right; white-space: nowrap; }
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+  /* position: relative keeps visually hidden header cells inside this
+     scroll box; without it they escape and widen the whole page. */
+  .table-scroll { position: relative; overflow-x: auto; }
+  /* Free text (worker ids, task names) may break anywhere; numbers never do. */
+  .break { overflow-wrap: anywhere; }
+  button { touch-action: manipulation; }
+
+  /* Phones: dead-letter rows stack, so Replay and Discard stay on screen
+     instead of sitting past the right edge of a sideways-scrolling table. */
+  @media (max-width: 640px) {
+    body { padding: 16px; }
+    .dlq thead {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0 0 0 0); border: 0;
+    }
+    .dlq tbody, .dlq td { display: block; }
+    .dlq tr {
+      display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 12px;
+      padding: 12px 0; border-bottom: 1px solid var(--panel-2);
+    }
+    .dlq tr:last-child { border-bottom: none; }
+    .dlq td { padding: 0; border: 0; }
+    .dlq .c-job { grid-column: 1; grid-row: 1; }
+    .dlq .c-task { grid-column: 1; grid-row: 2; }
+    .dlq .c-attempts { grid-column: 1; grid-row: 3; color: var(--muted); }
+    .dlq .c-attempts::before { content: "Attempts: "; }
+    .dlq .c-error { grid-column: 1 / -1; grid-row: 4; max-width: none; margin-top: 6px; }
+    .dlq .c-actions {
+      grid-column: 2; grid-row: 1 / span 3;
+      display: flex; flex-direction: column; gap: 6px;
+    }
+    .dlq .c-actions button { min-height: 32px; }
+    .dlq td.empty { grid-column: 1 / -1; }
+  }
   button:disabled:hover { border-color: var(--border); color: var(--text); }
   button.primary:disabled:hover { background: #238636; border-color: #2ea043; color: #fff; }
 </style>
@@ -118,9 +156,11 @@
 
   <div class="panel" style="margin-bottom:24px">
     <h2>Workers</h2>
-    <table><thead><tr>
-      <th>Worker</th><th>PID</th><th>Concurrency</th><th>Last heartbeat</th>
-    </tr></thead><tbody id="workers"></tbody></table>
+    <div class="table-scroll">
+      <table><thead><tr>
+        <th>Worker</th><th>PID</th><th>Concurrency</th><th>Last heartbeat</th>
+      </tr></thead><tbody id="workers"></tbody></table>
+    </div>
   </div>
 
   <div class="panel">
@@ -128,9 +168,14 @@
       <h2 style="margin:0">Dead-letter queue <span id="dead-count" class="mono"></span></h2>
       <button class="primary" id="replay-all">Replay all</button>
     </div>
-    <table><thead><tr>
-      <th>Job</th><th>Task</th><th>Attempts</th><th>Error</th><th style="width:150px"></th>
-    </tr></thead><tbody id="dead"></tbody></table>
+    <div class="table-scroll">
+      <!-- Explicit roles keep this a table for screen readers when the phone
+           layout turns its rows into blocks. -->
+      <table class="dlq" role="table"><thead role="rowgroup"><tr role="row">
+        <th role="columnheader">Job</th><th role="columnheader">Task</th><th role="columnheader">Attempts</th>
+        <th role="columnheader">Error</th><th role="columnheader" style="width:150px"></th>
+      </tr></thead><tbody id="dead" role="rowgroup"></tbody></table>
+    </div>
   </div>
 </div>
 <div id="toast"></div>
@@ -179,7 +224,9 @@ function kv(k, v, cls) {
 
 function emptyRow(colspan, text) {
   const tr = el("tr");
+  tr.setAttribute("role", "row");
   const td = el("td", "empty", text);
+  td.setAttribute("role", "cell");
   td.colSpan = colspan;
   tr.append(td);
   return tr;
@@ -216,7 +263,7 @@ function renderStats(s) {
     const age = w.last_beat ? (Date.now() / 1000 - w.last_beat) : null;
     const tr = el("tr");
     tr.append(
-      el("td", "mono", w.worker_id),
+      el("td", "mono break", w.worker_id),
       el("td", "mono", String(w.pid)),
       el("td", "mono", String(w.concurrency)),
       el("td", "mono", age === null ? "-" : age.toFixed(1) + "s ago"),
@@ -261,17 +308,24 @@ function actionButton(label, action, id, extraClass) {
   return b;
 }
 
+function cell(className, text) {
+  const td = el("td", className, text);
+  td.setAttribute("role", "cell");
+  return td;
+}
+
 function deadRow(j) {
   const tr = el("tr");
+  tr.setAttribute("role", "row");
   tr.dataset.id = j.id;
-  const idCell = el("td", "mono", j.id.slice(0, 10));
+  const idCell = cell("mono c-job", j.id.slice(0, 10));
   idCell.title = j.id;
   idCell.append(" ", el("span", "pill " + j.priority, j.priority));
-  const actions = el("td", "c-actions");
+  const actions = cell("c-actions");
   actions.append(actionButton("Replay", "replay", j.id, ""), " ",
                  actionButton("Discard", "discard", j.id, "danger"));
-  tr.append(idCell, el("td", "mono", j.type), el("td", "mono", String(j.attempts)),
-            el("td", "err-text", j.error || ""), actions);
+  tr.append(idCell, cell("mono break c-task", j.type), cell("mono c-attempts", String(j.attempts)),
+            cell("err-text c-error", j.error || ""), actions);
   return tr;
 }
 
