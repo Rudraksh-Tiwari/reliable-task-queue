@@ -80,7 +80,11 @@
   .row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 12px; }
   .empty { color: var(--dim); font-size: 13px; padding: 16px 8px; text-align: center; }
   .empty code { font-family: var(--mono); color: var(--muted); }
+  /* Chart text lives outside the SVG: the SVG stretches to fit its box
+     (preserveAspectRatio="none"), which squashes any text drawn inside it. */
+  .chart-scale { min-height: 18px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
   .chart-plot { position: relative; }
+  #chart .gridline { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
   .chart-empty { position: absolute; inset: 0; display: grid; place-items: center;
                  color: var(--dim); font-size: 13px; }
   .chart-empty[hidden] { display: none; }
@@ -190,8 +194,10 @@
           <span><i style="background:#f85149"></i>failed</span>
         </div>
       </div>
+      <p class="chart-scale" id="chart-scale"></p>
       <div class="chart-plot">
-        <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"></svg>
+        <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"
+             role="img" aria-label="Throughput chart, loading"></svg>
         <p class="chart-empty loading" id="chart-empty">Loading…</p>
       </div>
     </section>
@@ -355,18 +361,22 @@ function renderChart(points) {
   const empty = $("chart-empty");
   empty.textContent = "No jobs in the last 5 minutes.";
   empty.hidden = anyWork;
-  if (!anyWork) { svg.innerHTML = ""; return; }
+  if (!anyWork) {
+    svg.innerHTML = "";
+    $("chart-scale").textContent = "";
+    svg.setAttribute("aria-label", "Throughput chart: no jobs in the last 5 minutes.");
+    return;
+  }
   const W = 720, H = 180, pad = 4;
   const max = Math.max(1, ...points.map(p => p.succeeded + p.failed));
   const bw = W / points.length;
   // Only numbers computed here go into this markup, never API strings.
   let out = "";
-  // Horizontal gridlines + max label.
+  // Horizontal gridlines; the top one is the scale shown above the chart.
   for (let i = 1; i <= 3; i++) {
     const y = H - (H - 20) * (i / 3);
-    out += `<line x1="0" y1="${y}" x2="${W}" y2="${y}" stroke="#30363d" stroke-width="1"/>`;
+    out += `<line class="gridline" x1="0" y1="${y}" x2="${W}" y2="${y}"/>`;
   }
-  out += `<text x="4" y="14" fill="#848d97" font-size="11" font-family="monospace">${max}/bucket</text>`;
   points.forEach((p, i) => {
     const total = p.succeeded + p.failed;
     if (!total) return;
@@ -378,6 +388,11 @@ function renderChart(points) {
     if (hOk > 0) out += `<rect x="${x}" y="${H - hErr - hOk}" width="${w}" height="${hOk}" fill="#3fb950"/>`;
   });
   svg.innerHTML = out;
+  $("chart-scale").textContent = `Top line: ${max} jobs per 5 s`;
+  const ok = points.reduce((n, p) => n + p.succeeded, 0);
+  const failed = points.reduce((n, p) => n + p.failed, 0);
+  svg.setAttribute("aria-label",
+    `Throughput, last 5 minutes: ${ok} succeeded, ${failed} failed, at most ${max} jobs in any 5-second interval.`);
 }
 
 function actionButton(label, action, id, extraClass) {
