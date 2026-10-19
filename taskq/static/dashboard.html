@@ -140,14 +140,20 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>taskq <span id="queue-name">&middot; default</span></h1>
-    <div class="live"><span class="dot" id="dot"></span><span id="live-text">connecting…</span></div>
+    <h1><span translate="no">taskq</span> <span id="queue-name" translate="no">&middot; default</span></h1>
+    <div class="live"><span class="dot" id="dot" aria-hidden="true"></span><span id="live-text">connecting…</span></div>
+    <!-- Announces only connection changes. The visible timestamp above
+         changes every poll, so it is deliberately not a live region. -->
+    <p id="conn-announce" class="sr-only" role="status" aria-live="polite"></p>
   </header>
 
   <p id="notice" class="notice" hidden></p>
 
+  <main>
+
   <!-- Placeholders until the first response: "-" means "not known yet",
        so an unreachable API is never shown as an empty queue. -->
+  <h2 class="sr-only">Queue state</h2>
   <div class="grid cards" id="cards">
     <div class="card"><div class="label">Ready</div><div class="value">-</div><div class="sub">high -, normal -, low -</div></div>
     <div class="card"><div class="label">In flight</div><div class="value">-</div><div class="sub">leased to workers</div></div>
@@ -157,10 +163,10 @@
   </div>
 
   <div class="grid two">
-    <div class="panel">
+    <section class="panel" aria-labelledby="tp-title">
       <div class="row">
-        <h2 style="margin:0">Throughput &middot; last 5 min</h2>
-        <div class="legend">
+        <h2 id="tp-title" style="margin:0">Throughput &middot; last 5 min</h2>
+        <div class="legend" aria-hidden="true">
           <span><i style="background:#3fb950"></i>succeeded</span>
           <span><i style="background:#f85149"></i>failed</span>
         </div>
@@ -169,9 +175,9 @@
         <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"></svg>
         <p class="chart-empty loading" id="chart-empty">Loading…</p>
       </div>
-    </div>
-    <div class="panel">
-      <h2>Execution time</h2>
+    </section>
+    <section class="panel" aria-labelledby="lat-title">
+      <h2 id="lat-title">Execution time</h2>
       <div id="latency">
         <div class="kv"><span class="k">Jobs measured</span><span class="v">-</span></div>
         <div class="kv"><span class="k">Average</span><span class="v">-</span></div>
@@ -186,39 +192,42 @@
         <div class="kv"><span class="k">recovered</span><span class="v">-</span></div>
         <div class="kv"><span class="k">replayed</span><span class="v">-</span></div>
       </div>
-    </div>
+    </section>
   </div>
 
-  <div class="panel" style="margin-bottom:24px">
-    <h2>Workers</h2>
+  <section class="panel" style="margin-bottom:24px" aria-labelledby="workers-title">
+    <h2 id="workers-title">Workers</h2>
     <div class="table-scroll">
-      <table><thead><tr>
-        <th>Worker</th><th>PID</th><th>Concurrency</th><th>Last heartbeat</th>
+      <table><caption class="sr-only">Workers currently heartbeating</caption><thead><tr>
+        <th scope="col">Worker</th><th scope="col">PID</th><th scope="col">Concurrency</th><th scope="col">Last heartbeat</th>
       </tr></thead><tbody id="workers"><tr><td colspan="4" class="empty loading">Loading…</td></tr></tbody></table>
     </div>
-  </div>
+  </section>
 
-  <div class="panel">
+  <section class="panel" aria-labelledby="dead-title">
     <div class="row">
-      <h2 style="margin:0">Dead-letter queue <span id="dead-count" class="mono"></span></h2>
+      <h2 id="dead-title" style="margin:0">Dead-letter queue <span id="dead-count" class="mono"></span></h2>
       <button class="primary" id="replay-all" type="button" disabled>Replay all</button>
     </div>
     <div class="table-scroll">
       <!-- Explicit roles keep this a table for screen readers when the phone
            layout turns its rows into blocks. -->
-      <table class="dlq" role="table"><thead role="rowgroup"><tr role="row">
-        <th role="columnheader">Job</th><th role="columnheader">Task</th><th role="columnheader">Attempts</th>
-        <th role="columnheader">Error</th><th role="columnheader" style="width:150px"></th>
+      <table class="dlq" role="table"><caption class="sr-only">Jobs that used up their retries</caption>
+      <thead role="rowgroup"><tr role="row">
+        <th scope="col" role="columnheader">Job</th><th scope="col" role="columnheader">Task</th><th scope="col" role="columnheader">Attempts</th>
+        <th scope="col" role="columnheader">Error</th><th scope="col" role="columnheader" style="width:150px"><span class="sr-only">Actions</span></th>
       </tr></thead><tbody id="dead" role="rowgroup"><tr role="row"><td colspan="5" class="empty loading" role="cell">Loading…</td></tr></tbody></table>
     </div>
-  </div>
+  </section>
+  </main>
 </div>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let failures = 0;
 let lastOk = null;          // when the last refresh succeeded
+let connState = "connecting";
 // The dead-letter rows are rebuilt only when their contents change, so a
 // click (or keyboard focus) never lands on a button that a background
 // refresh has just replaced.
@@ -246,6 +255,10 @@ function toast(msg, isError) {
 }
 
 const oneDecimal = new Intl.NumberFormat(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+
+function announce(msg) {
+  $("conn-announce").textContent = msg;
+}
 
 function card(label, value, cls, sub) {
   const c = el("div", "card");
@@ -307,7 +320,7 @@ function renderStats(s) {
     const age = w.last_beat ? (Date.now() / 1000 - w.last_beat) : null;
     const tr = el("tr");
     tr.append(
-      el("td", "mono break", w.worker_id),
+      Object.assign(el("td", "mono break", w.worker_id), { translate: false }),
       el("td", "mono", String(w.pid)),
       el("td", "mono", String(w.concurrency)),
       el("td", "mono", age === null ? "-" : age.toFixed(1) + "s ago"),
@@ -351,6 +364,8 @@ function renderChart(points) {
 function actionButton(label, action, id, extraClass) {
   const b = el("button", extraClass, label);
   b.type = "button";
+  // "Replay" fifty times is meaningless to a screen reader: name the job.
+  b.setAttribute("aria-label", `${label} job ${id.slice(0, 10)}`);
   b.dataset.action = action;
   b.dataset.id = id;
   b.disabled = busy.has(id);
@@ -368,12 +383,15 @@ function deadRow(j) {
   tr.setAttribute("role", "row");
   tr.dataset.id = j.id;
   const idCell = cell("mono c-job", j.id.slice(0, 10));
+  idCell.translate = false;
   idCell.title = j.id;
   idCell.append(" ", el("span", "pill " + j.priority, j.priority));
   const actions = cell("c-actions");
   actions.append(actionButton("Replay", "replay", j.id, ""), " ",
                  actionButton("Discard", "discard", j.id, "danger"));
-  tr.append(idCell, cell("mono break c-task", j.type), cell("mono c-attempts", String(j.attempts)),
+  const taskCell = cell("mono break c-task", j.type);
+  taskCell.translate = false;
+  tr.append(idCell, taskCell, cell("mono c-attempts", String(j.attempts)),
             cell("err-text c-error", j.error || ""), actions);
   return tr;
 }
@@ -489,6 +507,8 @@ async function refresh() {
     $("dot").className = "dot ok";
     $("live-text").textContent = "live · " + lastOk.toLocaleTimeString();
     $("notice").hidden = true;
+    if (connState === "down") announce("Reconnected to the queue API.");
+    connState = "live";
   } catch (e) {
     // Don't wipe the last good render on a blip: keep it readable and say
     // how old it is, so "nothing is happening" is never confused with
@@ -501,6 +521,8 @@ async function refresh() {
       ? `Lost the connection to the API. Showing data from ${lastOk.toLocaleTimeString()}, retrying every 2 seconds.`
       : "Can't reach the API at /api/stats. Retrying every 2 seconds. Check that python -m taskq.api is running.";
     notice.hidden = false;
+    if (connState !== "down") announce("Lost the connection to the queue API.");
+    connState = "down";
     // Nothing has loaded yet, so the panels have no data to show at all.
     if (!lastOk) {
       for (const e of document.querySelectorAll(".loading")) e.textContent = "Waiting for the API…";
