@@ -82,14 +82,26 @@
   button.primary { background: #238636; border-color: #2ea043; color: #fff; }
   button.primary:hover { background: #2ea043; color: #fff; }
   button:disabled { opacity: 0.4; cursor: not-allowed; }
-  .row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 12px; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 8px 12px; }
   .empty { color: var(--dim); font-size: 13px; padding: 16px 8px; text-align: center; }
   .empty code { font-family: var(--mono); color: var(--muted); }
   /* Chart text lives outside the SVG: the SVG stretches to fit its box
      (preserveAspectRatio="none"), which squashes any text drawn inside it. */
-  .chart-scale { min-height: 18px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
+  .chart-scale { min-height: 18px; margin-bottom: 12px; font-size: 12px; color: var(--dim); }
+  .chart { display: grid; grid-template-columns: auto minmax(0, 1fr); column-gap: 8px; }
+  /* Tick labels sit on the gridlines at the top, middle and bottom. */
+  .chart-y {
+    display: flex; flex-direction: column; justify-content: space-between;
+    height: 194px; margin-top: -7px; line-height: 14px; text-align: right;
+    font-size: 12px; color: var(--dim); font-family: var(--mono);
+  }
+  .chart-x { grid-column: 2; display: flex; justify-content: space-between; margin-top: 4px;
+             font-size: 12px; color: var(--dim); font-family: var(--mono); }
   .chart-plot { position: relative; }
+  #chart { display: block; overflow: visible; }
   #chart .gridline { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+  #chart .bar-ok { fill: var(--ok); }
+  #chart .bar-err { fill: var(--err); }
   .chart-empty { position: absolute; inset: 0; display: grid; place-items: center;
                  color: var(--dim); font-size: 13px; }
   .chart-empty[hidden] { display: none; }
@@ -200,10 +212,14 @@
         </div>
       </div>
       <p class="chart-scale" id="chart-scale"></p>
-      <div class="chart-plot">
-        <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"
-             role="img" aria-label="Throughput chart, loading"></svg>
-        <p class="chart-empty loading" id="chart-empty">Loading…</p>
+      <div class="chart">
+        <div class="chart-y" aria-hidden="true"><span id="chart-ymax"></span><span id="chart-ymid"></span><span id="chart-y0"></span></div>
+        <div class="chart-plot">
+          <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"
+               role="img" aria-label="Throughput chart, loading"></svg>
+          <p class="chart-empty loading" id="chart-empty">Loading…</p>
+        </div>
+        <div class="chart-x" aria-hidden="true"><span>5 min ago</span><span>now</span></div>
       </div>
     </section>
     <section class="panel" aria-labelledby="lat-title">
@@ -360,8 +376,18 @@ function renderStats(s) {
                  el("code", "", "python -m taskq.worker"), ".")]));
 }
 
-function renderChart(points) {
+// Round the scale up to 1, 2 or 5 times a power of ten so ticks read cleanly.
+function niceMax(v) {
+  const pow = 10 ** Math.floor(Math.log10(Math.max(1, v)));
+  for (const step of [1, 2, 5, 10]) if (step * pow >= v) return step * pow;
+  return 10 * pow;
+}
+
+function renderChart(allPoints) {
   const svg = $("chart");
+  // The newest 5-second bucket is still filling; drawing it would show a
+  // false dip at the right edge on every poll, so it is left out.
+  const points = allPoints.slice(0, -1);
   const anyWork = points.some(p => p.succeeded + p.failed > 0);
   const empty = $("chart-empty");
   empty.textContent = "No jobs in the last 5 minutes.";
@@ -369,35 +395,37 @@ function renderChart(points) {
   if (!anyWork) {
     svg.innerHTML = "";
     $("chart-scale").textContent = "";
+    for (const id of ["chart-ymax", "chart-ymid", "chart-y0"]) $(id).textContent = "";
     svg.setAttribute("aria-label", "Throughput chart: no jobs in the last 5 minutes.");
     return;
   }
   const W = 720, H = 180, pad = 4;
-  const max = Math.max(1, ...points.map(p => p.succeeded + p.failed));
+  const peak = Math.max(...points.map(p => p.succeeded + p.failed));
+  const top = niceMax(peak);
   const bw = W / points.length;
   // Only numbers computed here go into this markup, never API strings.
   let out = "";
-  // Horizontal gridlines; the top one is the scale shown above the chart.
-  for (let i = 1; i <= 3; i++) {
-    const y = H - (H - 20) * (i / 3);
+  for (const y of [0, H / 2, H]) {
     out += `<line class="gridline" x1="0" y1="${y}" x2="${W}" y2="${y}"/>`;
   }
   points.forEach((p, i) => {
-    const total = p.succeeded + p.failed;
-    if (!total) return;
+    if (!(p.succeeded + p.failed)) return;
     const x = i * bw + pad / 2;
     const w = Math.max(1, bw - pad);
-    const hOk = (H - 20) * (p.succeeded / max);
-    const hErr = (H - 20) * (p.failed / max);
-    if (hErr > 0) out += `<rect x="${x}" y="${H - hErr}" width="${w}" height="${hErr}" fill="#f85149"/>`;
-    if (hOk > 0) out += `<rect x="${x}" y="${H - hErr - hOk}" width="${w}" height="${hOk}" fill="#3fb950"/>`;
+    const hOk = H * (p.succeeded / top);
+    const hErr = H * (p.failed / top);
+    if (hErr > 0) out += `<rect class="bar-err" x="${x}" y="${H - hErr}" width="${w}" height="${hErr}"/>`;
+    if (hOk > 0) out += `<rect class="bar-ok" x="${x}" y="${H - hErr - hOk}" width="${w}" height="${hOk}"/>`;
   });
   svg.innerHTML = out;
-  $("chart-scale").textContent = `Top line: ${max} jobs per 5 s`;
+  $("chart-scale").textContent = "Jobs per 5-second interval";
+  $("chart-ymax").textContent = top.toLocaleString();
+  $("chart-ymid").textContent = (top / 2).toLocaleString();
+  $("chart-y0").textContent = "0";
   const ok = points.reduce((n, p) => n + p.succeeded, 0);
   const failed = points.reduce((n, p) => n + p.failed, 0);
   svg.setAttribute("aria-label",
-    `Throughput, last 5 minutes: ${ok} succeeded, ${failed} failed, at most ${max} jobs in any 5-second interval.`);
+    `Throughput, last 5 minutes: ${ok} succeeded, ${failed} failed, at most ${peak} jobs in any 5-second interval.`);
 }
 
 function actionButton(label, action, id, extraClass) {
