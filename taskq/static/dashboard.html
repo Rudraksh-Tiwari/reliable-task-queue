@@ -28,10 +28,16 @@
   h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
   h1 span { color: var(--muted); font-weight: 400; font-family: var(--mono); font-size: 13px; }
   .live { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
-  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); }
   .dot.stale { background: var(--err); }
   h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
        color: var(--muted); font-weight: 600; margin-bottom: 10px; }
+  .notice {
+    margin-bottom: 20px; padding: 10px 14px; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--err); border-radius: 8px;
+  }
+  .notice[hidden] { display: none; }
   .grid { display: grid; gap: 12px; margin-bottom: 24px; }
   .cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
   .card {
@@ -66,6 +72,11 @@
   button:disabled { opacity: 0.4; cursor: not-allowed; }
   .row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 12px; }
   .empty { color: var(--dim); font-size: 13px; padding: 16px 8px; text-align: center; }
+  .empty code { font-family: var(--mono); color: var(--muted); }
+  .chart-plot { position: relative; }
+  .chart-empty { position: absolute; inset: 0; display: grid; place-items: center;
+                 color: var(--dim); font-size: 13px; }
+  .chart-empty[hidden] { display: none; }
   .pill { display: inline-block; padding: 1px 7px; border-radius: 20px; font-size: 11px;
           font-family: var(--mono); border: 1px solid var(--border); color: var(--muted); }
   .pill.high { color: var(--err); border-color: var(--err); }
@@ -130,10 +141,20 @@
 <div class="wrap">
   <header>
     <h1>taskq <span id="queue-name">&middot; default</span></h1>
-    <div class="live"><span class="dot" id="dot"></span><span id="live-text">connecting</span></div>
+    <div class="live"><span class="dot" id="dot"></span><span id="live-text">connecting…</span></div>
   </header>
 
-  <div class="grid cards" id="cards"></div>
+  <p id="notice" class="notice" hidden></p>
+
+  <!-- Placeholders until the first response: "-" means "not known yet",
+       so an unreachable API is never shown as an empty queue. -->
+  <div class="grid cards" id="cards">
+    <div class="card"><div class="label">Ready</div><div class="value">-</div><div class="sub">high -, normal -, low -</div></div>
+    <div class="card"><div class="label">In flight</div><div class="value">-</div><div class="sub">leased to workers</div></div>
+    <div class="card"><div class="label">Scheduled</div><div class="value">-</div><div class="sub">retries + delayed</div></div>
+    <div class="card"><div class="label">Dead</div><div class="value">-</div><div class="sub">needs attention</div></div>
+    <div class="card"><div class="label">Workers</div><div class="value">-</div><div class="sub">heartbeating</div></div>
+  </div>
 
   <div class="grid two">
     <div class="panel">
@@ -144,13 +165,27 @@
           <span><i style="background:#f85149"></i>failed</span>
         </div>
       </div>
-      <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"></svg>
+      <div class="chart-plot">
+        <svg id="chart" viewBox="0 0 720 180" preserveAspectRatio="none" style="width:100%;height:180px"></svg>
+        <p class="chart-empty loading" id="chart-empty">Loading…</p>
+      </div>
     </div>
     <div class="panel">
       <h2>Execution time</h2>
-      <div id="latency"></div>
+      <div id="latency">
+        <div class="kv"><span class="k">Jobs measured</span><span class="v">-</span></div>
+        <div class="kv"><span class="k">Average</span><span class="v">-</span></div>
+        <div class="kv"><span class="k">p95 (est.)</span><span class="v">-</span></div>
+      </div>
       <h2 style="margin-top:18px">Lifetime counters</h2>
-      <div id="counters"></div>
+      <div id="counters">
+        <div class="kv"><span class="k">succeeded</span><span class="v">-</span></div>
+        <div class="kv"><span class="k">failed</span><span class="v">-</span></div>
+        <div class="kv"><span class="k">retried</span><span class="v">-</span></div>
+        <div class="kv"><span class="k">dead</span><span class="v">-</span></div>
+        <div class="kv"><span class="k">recovered</span><span class="v">-</span></div>
+        <div class="kv"><span class="k">replayed</span><span class="v">-</span></div>
+      </div>
     </div>
   </div>
 
@@ -159,14 +194,14 @@
     <div class="table-scroll">
       <table><thead><tr>
         <th>Worker</th><th>PID</th><th>Concurrency</th><th>Last heartbeat</th>
-      </tr></thead><tbody id="workers"></tbody></table>
+      </tr></thead><tbody id="workers"><tr><td colspan="4" class="empty loading">Loading…</td></tr></tbody></table>
     </div>
   </div>
 
   <div class="panel">
     <div class="row">
       <h2 style="margin:0">Dead-letter queue <span id="dead-count" class="mono"></span></h2>
-      <button class="primary" id="replay-all">Replay all</button>
+      <button class="primary" id="replay-all" type="button" disabled>Replay all</button>
     </div>
     <div class="table-scroll">
       <!-- Explicit roles keep this a table for screen readers when the phone
@@ -174,7 +209,7 @@
       <table class="dlq" role="table"><thead role="rowgroup"><tr role="row">
         <th role="columnheader">Job</th><th role="columnheader">Task</th><th role="columnheader">Attempts</th>
         <th role="columnheader">Error</th><th role="columnheader" style="width:150px"></th>
-      </tr></thead><tbody id="dead" role="rowgroup"></tbody></table>
+      </tr></thead><tbody id="dead" role="rowgroup"><tr role="row"><td colspan="5" class="empty loading" role="cell">Loading…</td></tr></tbody></table>
     </div>
   </div>
 </div>
@@ -183,6 +218,7 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let failures = 0;
+let lastOk = null;          // when the last refresh succeeded
 // The dead-letter rows are rebuilt only when their contents change, so a
 // click (or keyboard focus) never lands on a button that a background
 // refresh has just replaced.
@@ -209,6 +245,8 @@ function toast(msg, isError) {
   t._timer = setTimeout(() => t.classList.remove("show"), isError ? 5000 : 2600);
 }
 
+const oneDecimal = new Intl.NumberFormat(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+
 function card(label, value, cls, sub) {
   const c = el("div", "card");
   c.append(el("div", "label", label), el("div", "value " + (cls || ""), String(value)));
@@ -222,12 +260,13 @@ function kv(k, v, cls) {
   return row;
 }
 
-function emptyRow(colspan, text) {
+function emptyRow(colspan, ...content) {
   const tr = el("tr");
   tr.setAttribute("role", "row");
-  const td = el("td", "empty", text);
+  const td = el("td", "empty");
   td.setAttribute("role", "cell");
   td.colSpan = colspan;
+  td.append(...content);
   tr.append(td);
   return tr;
 }
@@ -245,11 +284,16 @@ function renderStats(s) {
   );
 
   const lat = s.latency || {};
+  const measured = lat.count || 0;
+  // With nothing measured there is no average or p95, not a zero one.
+  let p95 = "-";
+  if (measured) {
+    p95 = lat.p95_ms === null || !isFinite(lat.p95_ms) ? "> 10 s" : "≤ " + lat.p95_ms + " ms";
+  }
   $("latency").replaceChildren(
-    kv("Jobs measured", (lat.count || 0).toLocaleString()),
-    kv("Average", (lat.avg_ms || 0).toFixed(1) + " ms"),
-    kv("p95 (est.)", lat.p95_ms === null || !isFinite(lat.p95_ms)
-        ? "> 10 s" : "≤ " + lat.p95_ms + " ms"),
+    kv("Jobs measured", measured.toLocaleString()),
+    kv("Average", measured ? oneDecimal.format(lat.avg_ms || 0) + " ms" : "-"),
+    kv("p95 (est.)", p95),
   );
 
   const c = s.counters || {};
@@ -269,12 +313,17 @@ function renderStats(s) {
       el("td", "mono", age === null ? "-" : age.toFixed(1) + "s ago"),
     );
     return tr;
-  }) : [emptyRow(4, "No workers running")]));
+  }) : [emptyRow(4, "No workers running. Start one with ",
+                 el("code", "", "python -m taskq.worker"), ".")]));
 }
 
 function renderChart(points) {
   const svg = $("chart");
-  if (!points.length) { svg.innerHTML = ""; return; }
+  const anyWork = points.some(p => p.succeeded + p.failed > 0);
+  const empty = $("chart-empty");
+  empty.textContent = "No jobs in the last 5 minutes.";
+  empty.hidden = anyWork;
+  if (!anyWork) { svg.innerHTML = ""; return; }
   const W = 720, H = 180, pad = 4;
   const max = Math.max(1, ...points.map(p => p.succeeded + p.failed));
   const bw = W / points.length;
@@ -436,14 +485,26 @@ async function refresh() {
     ]);
     renderStats(s); renderChart(tp.points); renderDead(d);
     failures = 0;
-    $("dot").classList.remove("stale");
-    $("live-text").textContent = "live · " + new Date().toLocaleTimeString();
+    lastOk = new Date();
+    $("dot").className = "dot ok";
+    $("live-text").textContent = "live · " + lastOk.toLocaleTimeString();
+    $("notice").hidden = true;
   } catch (e) {
-    // Don't wipe the last good render on a blip - just mark it stale, so
-    // the operator can tell "nothing is happening" from "I lost the feed".
+    // Don't wipe the last good render on a blip: keep it readable and say
+    // how old it is, so "nothing is happening" is never confused with
+    // "the feed is down".
     failures++;
-    $("dot").classList.add("stale");
+    $("dot").className = "dot stale";
     $("live-text").textContent = `disconnected (${failures})`;
+    const notice = $("notice");
+    notice.textContent = lastOk
+      ? `Lost the connection to the API. Showing data from ${lastOk.toLocaleTimeString()}, retrying every 2 seconds.`
+      : "Can't reach the API at /api/stats. Retrying every 2 seconds. Check that python -m taskq.api is running.";
+    notice.hidden = false;
+    // Nothing has loaded yet, so the panels have no data to show at all.
+    if (!lastOk) {
+      for (const e of document.querySelectorAll(".loading")) e.textContent = "Waiting for the API…";
+    }
   }
 }
 
