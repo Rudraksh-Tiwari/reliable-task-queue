@@ -111,6 +111,17 @@
   .pill.low { color: var(--dim); }
   .legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
   .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 5px; }
+  /* Execution-time histogram: one bar per latency bucket, p95 bucket
+     highlighted. Bars use --dim (5:1 on the panel), so they read as data. */
+  .hist { display: grid; grid-template-columns: repeat(11, minmax(0, 1fr)); gap: 3px;
+          height: 72px; align-items: end; margin-top: 12px; }
+  .hist-bar { background: var(--dim); min-height: 1px; border-radius: 2px 2px 0 0; }
+  .hist-bar.is-p95 { background: var(--text); }
+  .hist-labels { display: grid; grid-template-columns: repeat(11, minmax(0, 1fr)); gap: 3px;
+                 margin-top: 4px; font-size: 12px; color: var(--dim); font-family: var(--mono);
+                 white-space: nowrap; }
+  .hist-labels span:nth-child(n+2) { text-align: center; }
+  .hist-labels span:last-child { text-align: right; }
   .kv { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; font-size: 13px; }
   .kv + .kv { border-top: 1px solid var(--panel-2); }
   .kv .k { color: var(--muted); }
@@ -228,6 +239,11 @@
         <div class="kv"><span class="k">Jobs measured</span><span class="v">-</span></div>
         <div class="kv"><span class="k">Average</span><span class="v">-</span></div>
         <div class="kv"><span class="k">p95 (est.)</span><span class="v">-</span></div>
+      </div>
+      <div class="hist" id="lat-hist" role="img" aria-label="Execution time histogram, loading"></div>
+      <div class="hist-labels" aria-hidden="true">
+        <span>10ms</span><span></span><span></span><span>100ms</span><span></span><span></span>
+        <span>1s</span><span></span><span></span><span>10s</span><span>more</span>
       </div>
       <h2 style="margin-top:18px">Lifetime Counters</h2>
       <div id="counters">
@@ -355,6 +371,8 @@ function renderStats(s) {
     kv("p95 (est.)", p95),
   );
 
+  renderHistogram(lat);
+
   const c = s.counters || {};
   const colour = { succeeded: "v-ok", failed: "v-err", dead: "v-err",
                    recovered: "v-accent", retried: "v-warn", replayed: "" };
@@ -374,6 +392,34 @@ function renderStats(s) {
     return tr;
   }) : [emptyRow(4, "No workers running. Start one with ",
                  el("code", "", "python -m taskq.worker"), ".")]));
+}
+
+// The API reports cumulative buckets ("jobs at or under N ms"), as
+// Prometheus does. Subtracting neighbours gives the count inside each range;
+// whatever is left over took longer than the largest bound.
+function renderHistogram(lat) {
+  const buckets = lat.buckets || {};
+  const bounds = Object.keys(buckets).map(Number).sort((a, b) => a - b);
+  const total = lat.count || 0;
+  const cumulative = bounds.map(b => Number(buckets[b]) || 0);
+  const counts = cumulative.map((c, i) => c - (i ? cumulative[i - 1] : 0));
+  counts.push(Math.max(0, total - (cumulative[cumulative.length - 1] || 0)));
+  let p95 = cumulative.findIndex(c => c >= 0.95 * total);
+  if (p95 === -1) p95 = counts.length - 1;
+  const tallest = Math.max(1, ...counts);
+  $("lat-hist").replaceChildren(...counts.map((c, i) => {
+    const bar = el("div", "hist-bar" + (total && i === p95 ? " is-p95" : ""));
+    bar.style.height = `${(c / tallest) * 100}%`;
+    return bar;
+  }));
+  const fmt = (ms) => (ms >= 1000 ? `${ms / 1000} s` : `${ms} ms`);
+  const label = (i) => i === 0 ? `${fmt(bounds[0])} or less`
+    : i < bounds.length ? `${fmt(bounds[i - 1])} to ${fmt(bounds[i])}`
+    : `over ${fmt(bounds[bounds.length - 1])}`;
+  $("lat-hist").setAttribute("aria-label", total
+    ? "Execution time histogram: " + counts.map((c, i) => c ? `${label(i)}: ${c}` : "")
+        .filter(Boolean).join(", ") + `. The p95 falls in the ${label(p95)} bucket.`
+    : "Execution time histogram: no jobs measured yet.");
 }
 
 // Round the scale up to 1, 2 or 5 times a power of ten so ticks read cleanly.
